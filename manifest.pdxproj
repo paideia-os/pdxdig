@@ -1,32 +1,49 @@
 # pdxdig -- paideia-as build manifest
 #
-# Wave: R100  Milestone: Wave L drain (pdxdig#10, #11, #12, #13, #17)
+# Wave: R100  Milestone: Wave W drain (pdxdig#1, #2, #3, #6, #8)
 # Doc:  design/networking/r100-user-tools-plan.md §6 + §13.5
 #       (paideia-os repo).
 #
-# v1.1.0 (this landing, Wave L drain) scaffolds the pdxdig satellite
-# repo from the M1-001 seed (README + LICENSE only) up through:
-#   * pdxdig#10 (M4-002) -- NXDOMAIN smoke witness
-#   * pdxdig#11 (M4-003) -- timeout smoke witness
-#   * pdxdig#12 (M4-004) -- malformed-response fuzz-derived matrix
-#   * pdxdig#13 (M4-005) -- CNAME follow correctness (loop-guard 4)
-#   * pdxdig#17 (v1.1-B) -- semantic-pipe emission wire
-#     (DnsQueryRecord@0.1 via sys_semantic_send SC+ ID 115).
+# v1.2.0 (this landing, Wave W drain) extends the Wave L v1.1.0
+# scaffold with a full argv-surface parser and multi-branch result
+# dispatch:
+#   * pdxdig#1  (M1-001, honest witness) -- scaffold + KIND_USER
+#     caps.decl already complete in v1.1.0; recorded formally here.
+#   * pdxdig#2  (M1-002, real body) -- --dry-run / --type= /
+#     --server= / --timeout-ms= argv-surface parser via inline
+#     ArgvParse helpers.
+#   * pdxdig#3  (M1-003, real body) -- --dry-run first-runnable
+#     path: emits DnsQueryRecord@0.1 with result_code=DRY_RUN via
+#     sys_semantic_send + exits 0 with `pdxdig: dry-run ok\n` fd 2
+#     fingerprint band.
+#   * pdxdig#6  (M2-003, real body) -- --type=<non-A> emits
+#     result_code=UNSUPPORTED_QTYPE (4) + exits 4 with `pdxdig:
+#     unsupported qtype\n` fd 2 fingerprint band. Distinct exit
+#     from a real DNS failure (exit 3/1/etc).
+#   * pdxdig#8  (M3-002, honest witness) -- DnsQueryRecord@0.1
+#     schema bind + emit already landed at Wave L v1.1.0 (pdxdig#17);
+#     the txn_id slot is reserved at record[+43..+44] and stays 0
+#     at v1.2 (randomization gated on M2-001 UDP substrate).
 #
 # The real UDP query path (M2-001) is BLOCKED on §12.1 (SOCK_DGRAM
-# extension). At v1.1.0 the tool body:
-#   * parses argv (single positional <name>);
-#   * marshals a DnsQueryRecord@0.1 with result_code = DRY_RUN;
-#   * emits it via sys_semantic_send;
-#   * exits 3 (UNSUPPORTED_YET) with the diagnostic
-#     `pdxdig: udp stub\n` on fd 2.
+# extension). At v1.2.0 the tool body:
+#   * walks argv[1..argc]:
+#       -- peels --dry-run / --type= / --server= / --timeout-ms=
+#          via ArgvParse::argv_parse_eq_len / argv_parse_prefix;
+#       -- records the last positional as qname (dig(1) tail convention);
+#   * marshals a DnsQueryRecord@0.1 (qtype=1 always at v1.2);
+#   * emits via sys_semantic_send (SC+ 115);
+#   * dispatches terminal exit per flag set:
+#       --type=<non-A>  -> UNSUPPORTED_QTYPE record + exit 4
+#       --dry-run       -> DRY_RUN record + exit 0
+#       (no flag)       -> DRY_RUN record + `pdxdig: udp stub\n` + exit 3
 # All shared infrastructure (response walker, RCODE parser, CNAME
 # follow with loop-guard) is real code; the tests exercise it
 # against .rodata fixtures rather than live sockets, matching the
 # fixture-harness pattern pdxsock adopted at M4-001..M4-003.
 
 name        = pdxdig
-version     = 1.1.0
+version     = 1.2.0
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxdig.elf
@@ -36,6 +53,7 @@ caps_decl   = caps.decl
 # from `module <Basename> = structure { ... }` headers). --------------
 sources:
   - src/main.pdx                        # _start + argv parse + semantic-pipe emit
+  - src/argv_parse.pdx                  # ArgvParse prefix + eq_len helpers (Wave W)
   - src/dns_walker.pdx                  # RCODE parse + CNAME follow (loop-guard 4)
   - src/tool_ident.pdx                  # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
 

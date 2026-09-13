@@ -9,9 +9,70 @@ Version discipline:
              No v1.0.0 tag was ever cut.
   v1.1.0 -- Wave L drain: source scaffold + first-real-body tool
              + tests/*.pdx witnesses (pdxdig#10, #11, #12, #13, #17).
+  v1.2.0 -- Wave W drain: argv-surface parser + --dry-run/--type=
+             first-runnable branches + M1-001/M3-002 honest witnesses
+             (pdxdig#1, #2, #3, #6, #8).
 -->
 
 ## [Unreleased]
+
+## [1.2.0] -- 2026-09-13 -- Wave W drain
+
+### Added
+- **argv-surface parser (pdxdig#2, M1-002).** New module
+  `src/argv_parse.pdx` (module `ArgvParse`) with two pure-leaf
+  SysV helpers -- `argv_parse_prefix(arg, prefix, plen)` for
+  `--type=` / `--server=` / `--timeout-ms=` prefix detection and
+  `argv_parse_eq_len(arg, wanted, wlen)` for the `--dry-run` exact
+  gate (rejects `--dry-run-extra` via tail-NUL check). Main::_start
+  is rewritten as a proper argv walk (register plan: r12=argc,
+  r13=argv, r14=qname_ptr [last positional wins], r15=hash accum,
+  rbx=flag bit-set [bit0=dry_run, bit1=unsupp_qtype, bit2=unknown
+  flag], rbp=loop index). Unknown `-flag` -> usage exit 2; no
+  positional -> usage exit 2; recognized-but-unhandled --server=
+  and --timeout-ms= flow through as no-ops (real bindings arrive
+  with M2-002 and a future M2-004 landing).
+
+- **--dry-run first-runnable (pdxdig#3, M1-003).** The --dry-run
+  path marshals the same DnsQueryRecord@0.1 with result_code =
+  DRY_RUN (5), emits via `sys_semantic_send` (SC+ 115, schema tag
+  `0x446E735172797201` = "DnsQry"+ver01), prints `pdxdig: dry-run
+  ok\n` (19 wire bytes) on fd 2, and exits 0. The record is the
+  emission channel the plan §10.2 specifies -- "prints the record
+  it would emit" in the semantic-pipe world means "emits on the
+  semantic pipe with result_code = DRY_RUN so a consumer sees
+  the intended query without a network round-trip."
+
+- **UNSUPPORTED_QTYPE handling (pdxdig#6, M2-003).** `--type=<X>`
+  where `X` is anything other than exactly `A` (Main::_start byte-
+  checks arg[7]=='A' + arg[8]==NUL) sets rbx bit 1, marshals the
+  record with `pdxdig_dqr_tail_unsupp` (result_code = 4,
+  UNSUPPORTED_QTYPE), emits via `sys_semantic_send`, prints
+  `pdxdig: unsupported qtype\n` (26 wire bytes) on fd 2, and
+  exits with status 4 -- a distinct exit code from a real DNS
+  failure (exit 1 for parser mismatches, exit 3 for the UDP stub).
+  Precedence: --type=<non-A> beats --dry-run (a rejected --type=
+  is a client-side error regardless of --dry-run).
+
+### Recorded (honest witnesses -- no code change)
+- **Scaffold + KIND_USER caps.decl (pdxdig#1, M1-001).** The
+  v1.1.0 landing already carried `src/main.pdx`, `src/dns_walker.
+  pdx`, `src/tool_ident.pdx`, `manifest.pdxproj`, `link.ld`,
+  `deps.list`, and `caps.decl` (with `!KIND_USER 0x001` mandatory
+  + `KIND_UDP_SOCKET 0x00B` and `KIND_IPC_ENDPOINT 0x001`
+  optional). Wave W formally records this as closed rather than
+  leaving the M1-001 issue drifting.
+
+- **Semantic-pipe schema bind + emit (pdxdig#8, M3-002).** The
+  DnsQueryRecord@0.1 schema fingerprint constant
+  (`0x446E735172797201`), the 48-byte record layout, and the
+  `sys_semantic_send` emit wire already landed at Wave L v1.1.0
+  under pdxdig#17 (v1.1-B). The record's txn_id slot lives at
+  byte offset [+43..+44] within the tail u64 (visible in the
+  layout comment in `src/main.pdx`); at v1.2 the slot stays 0 --
+  a real per-query u16 randomization gates on the M2-001 UDP
+  substrate (§2.3.1). Wave W records the schema-bind + emit
+  contract formally as closed.
 
 ## [1.1.0] -- 2026-09-13 -- Wave L drain
 

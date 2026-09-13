@@ -1,0 +1,150 @@
+// src/argv_parse.pdx -- pdxdig v1.2.0 (Wave W drain: argv surface).
+//
+// Wave: R100  Milestone: M1-002 (pdxdig#2), M2-003 (pdxdig#6)
+// Doc:  design/networking/r100-user-tools-plan.md §6.1 + §13.5
+//
+// ArgvParse: pdxdig's inline argv-flag matcher. Two pure-leaf helpers
+// used by Main::_start to peel `--dry-run`, `--type=`, `--server=`,
+// and `--timeout-ms=` from argv without pulling libpdx-argv into
+// pdxdig's link set at v1.2 (libpdx-argv wire-in still parked until
+// the whole R100 tool family adopts it in one sweep).
+//
+// pdxdig v1.2.0 argv grammar (subset of §6.1 -- server/timeout-ms
+// are recognized but no-op'd; the real bindings arrive with the
+// M2-002 --server= landing and a future M2-004 --timeout-ms= landing):
+//
+//   pdxdig <name>                          -- STUB: emits DRY_RUN record + exit 3
+//   pdxdig --dry-run <name>                -- REAL: emits DRY_RUN record + exit 0
+//   pdxdig --type=A <name>                 -- alias of "<name>" (only supported qtype)
+//   pdxdig --type=<other> <name>           -- REAL: emits UNSUPPORTED_QTYPE + exit 4
+//   pdxdig --server=1.2.3.4 <name>         -- recognized, no-op at v1.2 (M2-002 real)
+//   pdxdig --timeout-ms=500 <name>         -- recognized, no-op at v1.2
+//   pdxdig                                 -- usage on fd 2; exit 2
+//   pdxdig -<anything unrecognized>        -- usage on fd 2; exit 2
+//
+// Order-insensitivity: flags and positional may appear in any order;
+// last positional wins (matches dig(1) tail-argument convention).
+//
+// Callable ABI (SysV amd64) -----------------------------------------
+//   argv_parse_prefix(arg_ptr, prefix_ptr, prefix_len) -> u64
+//   argv_parse_eq_len(arg_ptr, wanted_ptr, wanted_len) -> u64
+//     rdi = first arg, rsi = second, rdx = third; rax = return.
+//
+// Both helpers are pure leaves: no callee-save touch, no push/pop,
+// no stack use. Rsp%16==8 at entry (post-`call` from Main::_start)
+// is fine for a leaf that never nests a call. Callers preserve any
+// live values in rcx/r8/rax across the call themselves.
+//
+// paideia-as 0.36+ encoder discipline (per user memory `pdx encoder pitfalls`)
+// --------------------------------------------------------------------
+//   - No `test rN, rN` (every zero-check is `cmp rN, 0`).
+//   - No 2-op `imul r, imm` (unused).
+//   - No `and rN, imm64` on r8..r15 (unused).
+//   - No `neg` mnemonic (unused).
+//   - Byte loads via `xor rax, rax; mov_b rax, [ptr]` per paideia-as
+//     #1248 (REX.W upper-bits contract for mov_b).
+//   - Module basename PascalCase (`ArgvParse` for `argv_parse.pdx`).
+//   - Every label prefixed `ap_pfx_` / `ap_eq_` (reserved-word
+//     discipline; `loop` is a keyword and a bare `loop:` label fails
+//     to parse -- see paideia-as reserved-labels memo).
+
+module ArgvParse = structure {
+
+  // -------------------------------------------------------------------
+  // argv_parse_prefix(arg_ptr, prefix_ptr, prefix_len) -> u64
+  //
+  //   rdi = arg_ptr     (NUL-terminated candidate string)
+  //   rsi = prefix_ptr  (NUL-terminated or wire-length prefix bytes)
+  //   rdx = prefix_len  (bytes to compare, <= 2^31)
+  //   rax = 1 if arg_ptr[0..prefix_len] matches prefix_ptr[0..prefix_len]
+  //         AND arg_ptr did not hit its NUL terminator before consuming
+  //         the full prefix; 0 otherwise.
+  //
+  // Used for `--type=`, `--server=`, `--timeout-ms=` where the caller
+  // discriminates by prefix only and reads the value bytes at
+  // arg_ptr[prefix_len..] itself.
+  //
+  // Pure leaf, effects: {mem} for the two byte-stream reads.
+  // -------------------------------------------------------------------
+  pub let argv_parse_prefix : (u64, u64, u64) -> u64
+    !{mem} @{} =
+    fn (arg_ptr: u64) (prefix_ptr: u64) (prefix_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxdig Wave-W (pdxdig#2, #6) ArgvParse::argv_parse_prefix. Byte-by-byte compare of arg_ptr[0..prefix_len] against prefix_ptr[0..prefix_len]. Returns 1 on full-length match, 0 on any byte mismatch or when arg_ptr hits its NUL terminator before prefix_len bytes are consumed (short arg -- `--typ` cannot match `--type=`). Loop counter in rcx; rax caches the arg byte per iteration, r8 the prefix byte. cmp rcx, rdx uses jae so the loop exits cleanly when rcx == prefix_len. Pure leaf under SysV: no callee-save touch, no push/pop, no stack use. Rsp%16==8 at entry from a Main::_start `call` is safe for a leaf that never nests. Effects {mem} for the two byte-stream reads. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test` (every zero-check is `cmp rN, 0`); no 2-op `imul`; no wide-and (unused); byte loads via `xor rax, rax; mov_b rax, [rdi+rcx*1]` and `xor r8, r8; mov_b r8, [rsi+rcx*1]` per paideia-as #1248 REX.W upper-bits contract. Labels prefixed ap_pfx_. Caller-save clobbers: rax, rcx, rdx (unchanged), r8.",
+      block: {
+        xor rcx, rcx;
+      ap_pfx_loop:
+        cmp rcx, rdx;
+        jae ap_pfx_match;
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        cmp rax, 0;
+        je ap_pfx_nomatch;
+        xor r8, r8;
+        mov_b r8, [rsi + rcx*1];
+        cmp rax, r8;
+        jne ap_pfx_nomatch;
+        add rcx, 1;
+        jmp ap_pfx_loop;
+      ap_pfx_match:
+        mov rax, 1;
+        ret;
+      ap_pfx_nomatch:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // argv_parse_eq_len(arg_ptr, wanted_ptr, wanted_len) -> u64
+  //
+  //   rdi = arg_ptr     (NUL-terminated candidate string)
+  //   rsi = wanted_ptr  (byte sequence to match, len wanted_len)
+  //   rdx = wanted_len  (bytes to compare, <= 2^31)
+  //   rax = 1 if arg_ptr matches wanted_ptr for exactly wanted_len
+  //         bytes AND arg_ptr[wanted_len] == 0 (NUL immediately after
+  //         the matched region); 0 otherwise.
+  //
+  // Used for `--dry-run` (must not spuriously match a hypothetical
+  // `--dry-run-more`). Also usable for any future exact-flag gate
+  // (e.g., `--help`, `--version`) that libpdx-argv would classify
+  // as FKIND_BOOL.
+  //
+  // Pure leaf, effects: {mem}.
+  // -------------------------------------------------------------------
+  pub let argv_parse_eq_len : (u64, u64, u64) -> u64
+    !{mem} @{} =
+    fn (arg_ptr: u64) (wanted_ptr: u64) (wanted_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxdig Wave-W (pdxdig#2, --dry-run gate) ArgvParse::argv_parse_eq_len. Byte-by-byte compare of arg_ptr[0..wanted_len] against wanted_ptr[0..wanted_len]; on full-length match additionally reads arg_ptr[wanted_len] and requires it to be NUL so `--dry-run-extra` does NOT spuriously match `--dry-run`. Returns 1 on exact match, 0 on any byte mismatch, on arg NUL before wanted_len bytes consumed, OR on non-NUL byte at arg_ptr[wanted_len]. Loop identical to argv_parse_prefix with the added tail-NUL check inline before the `mov rax, 1; ret`. Pure leaf; same rsp/callee-save posture as argv_parse_prefix. Effects {mem}. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test`; no 2-op `imul`; no wide-and (unused); byte loads via `xor rax, rax; mov_b rax, [ptr]` + `xor r8, r8; mov_b r8, [ptr]`. Labels prefixed ap_eq_. Clobbers rax, rcx, r8.",
+      block: {
+        xor rcx, rcx;
+      ap_eq_loop:
+        cmp rcx, rdx;
+        jae ap_eq_tail_nul;
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        cmp rax, 0;
+        je ap_eq_nomatch;
+        xor r8, r8;
+        mov_b r8, [rsi + rcx*1];
+        cmp rax, r8;
+        jne ap_eq_nomatch;
+        add rcx, 1;
+        jmp ap_eq_loop;
+      ap_eq_tail_nul:
+        xor rax, rax;
+        mov_b rax, [rdi + rcx*1];
+        cmp rax, 0;
+        jne ap_eq_nomatch;
+        mov rax, 1;
+        ret;
+      ap_eq_nomatch:
+        xor rax, rax;
+        ret;
+      }
+    }
+
+}

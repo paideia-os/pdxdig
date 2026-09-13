@@ -1,4 +1,4 @@
-// src/tool_ident.pdx -- pdxdig v1.1.0 (Wave L drain: PDX_TOOL_NAME extern)
+// src/tool_ident.pdx -- pdxdig v1.2.0 (Wave W drain: PDX_TOOL_NAME extern)
 // ToolIdent module: per-tool identity externs.
 //
 // Purpose
@@ -12,10 +12,10 @@
 // eventual libpdx-argv bump (^0.1 -> ^1.1) is a manifest edit rather
 // than a source edit.
 //
-// pdxdig at v1.1.0 does NOT yet link libpdx-argv (argv parse is
-// inline in src/main.pdx), but the symbols are added preemptively so
-// a later M1-002 bump does not require touching this file. Same
-// discipline mkdir/cp/cat/mv/rm follow.
+// pdxdig at v1.2.0 does NOT yet link libpdx-argv (argv parse is
+// inline via ArgvParse); the symbols are still published so a later
+// libpdx-argv wire-in is a manifest edit rather than a source edit.
+// Same discipline mkdir/cp/cat/mv/rm follow.
 //
 // paideia-as compliance
 // ---------------------
@@ -23,13 +23,13 @@
 //   - No function bodies -> no register plan, no encoder guardrails.
 //   - Array size == literal byte count INCLUDING NUL:
 //       "pdxdig\0"  = 7 bytes
-//       "1.1.0\0"   = 6 bytes
+//       "1.2.0\0"   = 6 bytes
 //   - Both symbols `pub let` (public + immutable = .rodata) so the
 //     linker can resolve libpdx-argv's UND refs against them.
 
 module ToolIdent = structure {
 
   pub let PDX_TOOL_NAME    : [u8; 7] = "pdxdig\0"
-  pub let PDX_TOOL_VERSION : [u8; 6] = "1.1.0\0"
+  pub let PDX_TOOL_VERSION : [u8; 6] = "1.2.0\0"
 
 }
