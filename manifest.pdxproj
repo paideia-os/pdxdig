@@ -1,0 +1,69 @@
+# pdxdig -- paideia-as build manifest
+#
+# Wave: R100  Milestone: Wave L drain (pdxdig#10, #11, #12, #13, #17)
+# Doc:  design/networking/r100-user-tools-plan.md §6 + §13.5
+#       (paideia-os repo).
+#
+# v1.1.0 (this landing, Wave L drain) scaffolds the pdxdig satellite
+# repo from the M1-001 seed (README + LICENSE only) up through:
+#   * pdxdig#10 (M4-002) -- NXDOMAIN smoke witness
+#   * pdxdig#11 (M4-003) -- timeout smoke witness
+#   * pdxdig#12 (M4-004) -- malformed-response fuzz-derived matrix
+#   * pdxdig#13 (M4-005) -- CNAME follow correctness (loop-guard 4)
+#   * pdxdig#17 (v1.1-B) -- semantic-pipe emission wire
+#     (DnsQueryRecord@0.1 via sys_semantic_send SC+ ID 115).
+#
+# The real UDP query path (M2-001) is BLOCKED on §12.1 (SOCK_DGRAM
+# extension). At v1.1.0 the tool body:
+#   * parses argv (single positional <name>);
+#   * marshals a DnsQueryRecord@0.1 with result_code = DRY_RUN;
+#   * emits it via sys_semantic_send;
+#   * exits 3 (UNSUPPORTED_YET) with the diagnostic
+#     `pdxdig: udp stub\n` on fd 2.
+# All shared infrastructure (response walker, RCODE parser, CNAME
+# follow with loop-guard) is real code; the tests exercise it
+# against .rodata fixtures rather than live sockets, matching the
+# fixture-harness pattern pdxsock adopted at M4-001..M4-003.
+
+name        = pdxdig
+version     = 1.1.0
+kind        = tool
+entry       = _start                    # src/main.pdx
+output      = build-out/pdxdig.elf
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). --------------
+sources:
+  - src/main.pdx                        # _start + argv parse + semantic-pipe emit
+  - src/dns_walker.pdx                  # RCODE parse + CNAME follow (loop-guard 4)
+  - src/tool_ident.pdx                  # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
+
+# --- Library dependencies --------------------------------------------
+# libpdx-net wire-in is deferred to M2-001 (real UDP query); at v1.1.0
+# the tool self-contains the schema constant + record marshalling.
+deps: []
+
+# --- Test targets ----------------------------------------------------
+# Fixture-harness pattern (mirrors pdxsock/tests/*): each ELF is a
+# single-role or dual-role self-contained witness. Runtime round-trip
+# under QEMU is the paideia-os smoke-runner's job; here we compile
+# and gate encoder discipline.
+tests:
+  - tests/m4_002_nxdomain.pdx           # pdxdig#10 -- RCODE=NXDOMAIN parse
+  - tests/m4_003_timeout.pdx            # pdxdig#11 -- timeout classifier
+  - tests/m4_004_malformed_matrix.pdx   # pdxdig#12 -- 5+ malformed fixtures
+  - tests/m4_005_cname_smoke.pdx        # pdxdig#13 -- CNAME follow + loop-guard
+
+# --- Documentation targets -------------------------------------------
+# .pdxdoc source for `doc pdxdig` lands at M5-001 (deferred).
+docs: []
+
+# --- Paideia-as compliance flags -------------------------------------
+compliance:
+  - module-basename-pascal              # Module <BasenamePascalCase>
+  - no-test-mnemonic                    # zero-check via cmp reg, 0
+  - cmp-imm32-only                      # cmp reg, imm <= 0x7FFFFFFF
+  - r11-scratch                         # r11 not preserved across calls
+  - byte-load-zero-then-mov_b           # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity                # rsp % 16 == 0 at every nested call

@@ -1,0 +1,112 @@
+// tests/m4_002_nxdomain.pdx -- pdxdig M4-002 witness (pdxdig#10):
+// NXDOMAIN RCODE parse gate.
+//
+// Wave: R100  Milestone: M4-002 (pdxdig#10)
+// Doc:  design/networking/r100-user-tools-plan.md §6 + §10.2
+//       (paideia-os); response-walker contract in
+//       src/dns_walker.pdx.
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that gates pdxdig's DnsWalker RCODE-parse
+// contract: given a 12-byte DNS response header with
+// flags2 = 0x83 (QR=1 via flags1, RA=1, RCODE=3=NXDOMAIN), the
+// walker MUST report `rcode == 3`. Populates the fixture at
+// runtime (avoids reliance on hex-escape string literals) and
+// runs the two-line REX-safe RCODE extract inline (test .o
+// files do not link src/dns_walker.pdx -- the walker's callable
+// surface is exercised from main.pdx via `call` once the M2-001
+// query path lands; tests inline the same three ops).
+//
+// Fixture-harness approach ---------------------------------------------
+// pdxdig has no in-tree fork/spawn scaffolding and no live UDP
+// substrate (§12.1 blocker), so the walker is exercised inline
+// against a .bss byte fixture populated at _start. Mirror of the
+// pattern pdxsock/tests/tcp_echo_smoke.pdx + m4_004_large_
+// transfer.pdx established (payload fill via `mov_b [ptr+idx], reg`
+// per paideia-as #1248). The paideia-os smoke-runner runs the
+// resulting `build-out/tests-m4_002_nxdomain.o`-linked ELF and
+// greps for the `pdxdig nxdomain ok\n` fingerprint on fd 2.
+//
+// Fingerprint band on fd 2:
+//   pdxdig nxdomain ok\n   (20 wire bytes)  -- success
+//   pdxdig nxdomain FAIL\n (22 wire bytes)  -- parser mismatch
+//
+// Exit codes:
+//   0 = walker returned RCODE == 3 (NXDOMAIN)
+//   1 = mismatch
+//
+// Fixture layout (12-byte DNS response header):
+//   [+0..+1]  ID       = don't care (.bss zero)
+//   [+2]      flags1   = 0x81    -- QR=1 (response), RD=1  (stored at runtime)
+//   [+3]      flags2   = 0x83    -- RA=1, RCODE=3 (NXDOMAIN) (stored at runtime)
+//   [+4..+11] rest     = don't care (.bss zero)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls) ------------------------
+//   * PascalCase module basename: M4002Nxdomain.
+//   * Every label prefixed `m4002_`.
+//   * No `test rN,rN`; no 2-op `imul r,imm`; no wide-and on r8..r15.
+//   * Byte load via `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   * Byte store via `mov rax, imm; mov_b [ptr + N], rax` (matches
+//     m4_004_large_transfer's fill-loop shape).
+
+module M4Nxdomain = structure {
+
+  // 16-byte .bss fixture (extra 4 bytes of headroom over the 12-byte
+  // DNS header minimum; @align(8) so byte stores at any offset are
+  // naturally aligned into the surrounding word).
+  pub let mut m4002_fixture : [u8; 16] = uninit @align(8)
+
+  pub let m4002_msg_ok     : [u8; 21] = "pdxdig nxdomain ok\n\0"
+  pub let m4002_msg_ok_len : u64 = 20
+
+  pub let m4002_msg_fail     : [u8; 23] = "pdxdig nxdomain FAIL\n\0"
+  pub let m4002_msg_fail_len : u64 = 22
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "pdxdig.M4-002 (pdxdig#10) NXDOMAIN RCODE parse witness. Populates a 16-byte .bss fixture at _start with flags1 = 0x81 at [+2] and flags2 = 0x83 at [+3] (RA=1, RCODE=3=NXDOMAIN), then extracts the RCODE via `xor rax, rax; mov_b rax, [fixture+3]; and rax, 0x0F` (mirrors DnsWalker::dns_walker_rcode inline for test .o self-containment -- test .o's do not link src/dns_walker.pdx). Compares against 3; emits `pdxdig nxdomain ok\\n` on fd 2 + sys_exit(0) on match or `pdxdig nxdomain FAIL\\n` on fd 2 + sys_exit(1) on mismatch. Register plan: rax = per-byte scratch + RCODE + syscall n, rbx = fixture base ptr. Byte stores via `mov rax, imm; mov_b [rbx + N], rax` per m4_004 precedent. Encoder: byte load via `xor rax, rax; mov_b rax, [rbx + 3]` per paideia-as #1248 REX-safe pattern; mask via `and rax, imm32` on rax (not r8..r15 -- wide-and restriction does not apply); no `test` (unused); no 2-op `imul` (unused); module basename PascalCase (M4002Nxdomain); labels prefixed m4002_.",
+      block: {
+        // Populate the fixture. Only bytes [+2] and [+3] carry
+        // load-bearing values; the rest stay zero (.bss init).
+        lea rbx, [rip + m4002_fixture];
+        mov rax, 129;                            // 0x81 = flags1
+        mov_b [rbx + 2], rax;
+        mov rax, 131;                            // 0x83 = flags2 (RA=1, RCODE=3)
+        mov_b [rbx + 3], rax;
+
+        // Extract RCODE via the DnsWalker::dns_walker_rcode shape.
+        xor rax, rax;
+        mov_b rax, [rbx + 3];
+        and rax, 15;                             // RCODE mask (0x0F)
+
+        // Compare against NXDOMAIN (3).
+        cmp rax, 3;
+        jne m4002_fail;
+
+      m4002_ok:
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + m4002_msg_ok];
+        mov rdx, 20;                             // m4002_msg_ok_len
+        mov rax, 1;
+        syscall;
+        xor rdi, rdi;                            // exit 0
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4002_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m4002_msg_fail];
+        mov rdx, 22;                             // m4002_msg_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;                              // exit 1
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

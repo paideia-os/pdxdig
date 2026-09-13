@@ -1,0 +1,267 @@
+// src/main.pdx -- pdxdig v1.1.0 (Wave L drain).
+//
+// pdxdig: DNS query CLI (`dig`-equivalent). This file is the ring-3
+// ELF entry point (`_start`), argv-wired per the frozen execve ABI
+// (design/user/execve-abi.md in the paideia-os monorepo):
+//   rdi = argc, rsi = argv (VA of a char*[]), rdx = envp (unused),
+//   rsp % 16 == 0 at entry.
+//
+// Wave L "source scaffold + real-body seed" scope
+// -----------------------------------------------
+// Retires the M1-001 README-only seed. Ships the argv classifier,
+// the diagnostic message band, the DnsQueryRecord@0.1 marshal
+// block, and the `sys_semantic_send` (SC+ ID 115) emit wire
+// (pdxdig#17). The REAL UDP query path (pdxdig.M2-001) is BLOCKED
+// on §12.1 (SOCK_DGRAM extension); at v1.1.0 the tool marshals a
+// record with `result_code = DRY_RUN` and exits 3 with
+// `pdxdig: udp stub\n` on fd 2. The emit wire itself is real; a
+// follow-up M2-001 landing flips the classifier to record real
+// outcomes without touching the marshal or send-syscall layout.
+//
+// Argv grammar (v1.1.0 subset per §6.1):
+//   pdxdig <name>              -- query <name> (STUB: emits record + exit 3)
+//   pdxdig                     -- usage on fd 2; exit 2
+//   pdxdig <anything longer>   -- usage on fd 2; exit 2
+//
+// Full argv (--type= / --server= / --timeout-ms= / --dry-run) is
+// deferred to pdxdig.M1-002 (argv surface). At M1-002 the positional
+// <name> shifts to the tail and the flag scanner peels the leading
+// options; the emit block below reads `qname` from a callee-save
+// register that at v1.1.0 is set from `argv[1]` (the sole positional
+// slot).
+//
+// DnsQueryRecord@0.1 layout (48 bytes, @align(8); §10.2 of the R100
+// user-tools plan):
+//
+//   [ +0]  magic        [u8; 8] -- "PDXKDIG_" ASCII, LE u64
+//                                   0x5F474944584450 (grep-friendly
+//                                   self-identifier for the pdxdig
+//                                   record family).
+//   [ +8]  version:u32 | flags:u32  -- version = 1 (v0.1 schema);
+//                                       flags = 0 at v1.1.0.
+//   [+16]  audit_id     u64      -- 0 at v1.1.0 (libpdx-audit wire
+//                                    deferred to pdxdig.M3-001).
+//   [+24]  qname_hash   u64      -- BLAKE3-lite-shaped hash of the
+//                                    argv <name> (v1.1.0: a rolling-
+//                                    add hash placeholder -- the
+//                                    schema fingerprint reserves the
+//                                    u64 slot; consumers that need
+//                                    the raw qname walk the audit
+//                                    journal via audit_id).
+//   [+32]  qtype:u16 | answer_ip:u32 | ttl_hi:u16
+//                                 -- packed. qtype = 1 (A) at v1.1.0
+//                                    (only supported type; --type=
+//                                    beyond A returns UNSUPPORTED
+//                                    at M2-003). answer_ip = 0
+//                                    (no query issued at STUB).
+//                                    ttl_hi = high 16 bits of ttl_u32.
+//   [+40]  ttl_lo:u16 | cname_hops:u8 | txn_id:u16 | result_code:u8
+//        | reserved:u16          -- packed. ttl_lo = low 16 bits of
+//                                    ttl_u32; cname_hops = 0 at STUB;
+//                                    txn_id = 0 at STUB (real path
+//                                    randomizes per §2.3.1); result_
+//                                    code = DRY_RUN (5) at STUB.
+//
+// Result_code enum (§10.2):
+//   OK                   = 0
+//   NXDOMAIN             = 1
+//   TIMEOUT              = 2
+//   MALFORMED_RESPONSE   = 3
+//   UNSUPPORTED_QTYPE    = 4
+//   DRY_RUN              = 5
+//
+// Schema tag: 0x446E735172797201 -- ASCII-mnemonic ("DnsQry" +
+// version 0x01) stable u64 fingerprint for DnsQueryRecord@0.1
+// preserved verbatim once paideia-os#2000 (schema registry) lands.
+// Grep-friendly per design/networking/r100-user-tools-plan.md §10
+// note that "every wave binds a schema fingerprint constant"
+// pre-registry.
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory)
+// ---------------------------------------------------------------
+//   - No `test rN, rN` (every zero-check is `cmp rN, 0`).
+//   - No 2-op `imul r, imm`.
+//   - No `and rN, imm64` on r8..r15 (all masks fit in imm32).
+//   - Byte loads via `xor rax, rax; mov_b rax, [ptr]`.
+//   - Module basename PascalCase (`Main` for `main.pdx`).
+//   - Every label prefixed `pdxdig_` (reserved-word discipline;
+//     `loop`, `if` etc. are keywords and bare labels fail to parse).
+//   - String literals single-line; `[u8; N] = "...\0"` with N =
+//     literal-byte-count-including-NUL; sibling `_len` = wire byte
+//     count (excludes NUL).
+//
+// SC+ IDs used (matches src/user/syscall_shim.pdx through 115):
+//   1   = sys_write         (fd, buf, count)      -> n | -errno
+//   60  = sys_exit          (status)              -> never returns
+//   115 = sys_semantic_send (schema, rec_ptr, len) -> 0 | -errno
+
+module Main = structure {
+
+  // -------------------------------------------------------------------
+  // Diagnostic messages. Every literal one line; `_len` sibling is the
+  // wire byte count (excludes NUL).
+  // -------------------------------------------------------------------
+  pub let pdxdig_msg_usage       : [u8; 15] = "pdxdig: usage\n\0"
+  pub let pdxdig_msg_usage_len   : u64 = 14
+
+  pub let pdxdig_msg_udp_stub    : [u8; 18] = "pdxdig: udp stub\n\0"
+  pub let pdxdig_msg_udp_stub_len : u64 = 17
+
+  // -------------------------------------------------------------------
+  // Semantic-pipe (pdxdig#17) constants + record buffer.
+  //
+  // pdxdig_record_buf: 48-byte marshalled DnsQueryRecord@0.1. .bss,
+  // @align(8), uninit; every field overwritten at emit time.
+  //
+  // pdxdig_schema_dns_query: the schema fingerprint the kernel stores
+  // verbatim into the ring slot's schema u64. Grep-searchable ASCII-
+  // mnemonic "DnsQry" + version 0x01.
+  //
+  // pdxdig_dqr_magic: leading 8 ASCII bytes ("PDXKDIG_", LE u64) the
+  // emit block writes at record[+0]. Loaded via inline movabs in the
+  // marshal block (avoids a second rip-relative fetch).
+  //
+  // pdxdig_dqr_version_and_flags: packs version:u32 (=1) in bits
+  // [0..31] and flags:u32 (=0) in bits [32..63] so one u64 store
+  // places both fields in one instruction.
+  //
+  // pdxdig_dqr_result_dry_run: result_code = DRY_RUN (5), packed
+  // into the [+40..+48] tail with cname_hops = txn_id = 0 and
+  // ttl_lo = 0. Layout: ttl_lo(u16=0) | cname_hops(u8=0) |
+  //                     txn_id(u16=0) | result_code(u8=5) | reserved(u16=0)
+  // As a LE u64: byte offsets 0..1=ttl_lo, byte 2=cname_hops,
+  // bytes 3..4=txn_id, byte 5=result_code, bytes 6..7=reserved.
+  // -> 0x0000_05_0000_00_0000 = 0x0000050000000000.
+  // -------------------------------------------------------------------
+  pub let mut pdxdig_record_buf          : [u8; 48] = uninit @align(8)
+
+  pub let pdxdig_schema_dns_query        : u64 = 0x446E735172797201
+  pub let pdxdig_dqr_magic               : u64 = 0x005F474944584450
+  pub let pdxdig_dqr_version_and_flags   : u64 = 0x0000000000000001
+  pub let pdxdig_dqr_result_dry_run_tail : u64 = 0x0000050000000000
+
+  // -------------------------------------------------------------------
+  // _start -- pdxdig entry point. Never returns; every terminal path
+  // ends in sys_exit.
+  //
+  // Register plan:
+  //   r12 = argc
+  //   r13 = argv base
+  //   r14 = qname_ptr (argv[1] at v1.1.0)
+  //   r15 = qname_hash (rolling-add u64 over the argv[1] bytes,
+  //         computed inline; placeholder for BLAKE3-lite once
+  //         paideia-as gains the shim)
+  //
+  // Exit statuses:
+  //   0 = clean completion (never taken at v1.1.0 -- STUB always exits 3)
+  //   2 = argv usage refusal
+  //   3 = UDP path not yet wired (M2-001 blocker; per §11.5 fail-closed)
+  //
+  // Effects: {mem, sysreg}  Caps: @{fs, sched, cap}
+  //   fs   -- sys_write for the diagnostic
+  //   sched-- sys_exit
+  //   cap  -- sys_semantic_send is capability-ungated at R107-M0-001
+  //           but the wave-standard cap set names {cap} for the
+  //           future KIND_SEMANTIC_PIPE recv-side gate (caps.decl
+  //           already carries KIND_IPC_ENDPOINT optional for it).
+  // -------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched, cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched, cap},
+      justification: "pdxdig v1.1.0 (Wave L drain) real _start scaffold. Retires the M1-001 README-only seed with an argv classifier + DnsQueryRecord@0.1 marshal + sys_semantic_send emit (pdxdig#17, v1.1-B). Argv gate: argc == 2 -> take argv[1] as qname, compute a rolling-add u64 hash for the record's qname_hash slot, marshal the 48-byte DnsQueryRecord@0.1 (magic PDXKDIG_ + version 1 + flags 0 + audit_id 0 + qname_hash + qtype/answer_ip/ttl_hi packed + ttl_lo/cname_hops/txn_id/result_code/reserved packed with result_code = DRY_RUN (5)), emit via sys_semantic_send (SC+ ID 115, schema tag 0x446E735172797201 = 'DnsQry'+ver01), print `pdxdig: udp stub\\n` on fd 2, sys_exit(3). argc != 2 -> print `pdxdig: usage\\n` on fd 2, sys_exit(2). Register plan: r12 = argc, r13 = argv base, r14 = qname_ptr (argv[1]), r15 = qname_hash accumulator (rolling-add over qname bytes, u64). All callee-save survives every SYSCALL by the amd64 fast-syscall convention. sys_semantic_send return (0 / -EFAULT / -EINVAL) intentionally discarded: this is a marshalling failure surface, not a per-run condition. The real UDP query path (M2-001) flips result_code from DRY_RUN to OK/NXDOMAIN/TIMEOUT/MALFORMED_RESPONSE/UNSUPPORTED_QTYPE per outcome without touching the marshal layout. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (rolling-add hash uses `shl+add` for *33-style folds -- here we use pure add since the point is a stable placeholder, not a real hash); byte loads use `xor rax, rax; mov_b rax, [ptr]`; module basename Main; labels prefixed pdxdig_. rip-relative u64 stores via `mov [rip + label], reg` and loads via `mov reg, [rip + label]` proven at src/kernel/core/syscall/handlers/sys_semantic_send.pdx line 214. movabs for the 8-byte schema constant proven at same file line 221.",
+      block: {
+        // ---- Step 0: latch argc / argv from execve-ABI registers. ----
+        mov r12, rdi;                            // r12 = argc
+        mov r13, rsi;                            // r13 = argv
+
+        // ---- Step 1: argc gate. ------------------------------------
+        cmp r12, 2;
+        jne pdxdig_usage;
+
+        // ---- Step 2: capture qname pointer + compute rolling-add
+        //              hash placeholder over its bytes. Loop bound by
+        //              the terminating NUL. Overrun-safe under the
+        //              execve ABI's NUL-terminated argv guarantee.
+        mov r14, [r13 + 8];                      // r14 = argv[1] = qname_ptr
+        xor r15, r15;                            // r15 = hash accum
+        xor rcx, rcx;                            // rcx = cursor
+      pdxdig_hash_loop:
+        xor rax, rax;
+        mov_b rax, [r14 + rcx*1];
+        cmp rax, 0;
+        je pdxdig_hash_done;
+        add r15, rax;                            // hash += byte (placeholder fold)
+        add rcx, 1;
+        jmp pdxdig_hash_loop;
+      pdxdig_hash_done:
+
+        // ---- Step 3: marshal the 48-byte DnsQueryRecord@0.1. -------
+        //
+        // r10 = record base pointer. r11 scratched for each field.
+        lea r10, [rip + pdxdig_record_buf];
+
+        // magic (inline movabs -- "PDXKDIG_" LE u64).
+        mov r11, 0x005F474944584450;
+        mov [r10 + 0], r11;
+
+        // version | flags -- one u64 store.
+        mov r11, [rip + pdxdig_dqr_version_and_flags];
+        mov [r10 + 8], r11;
+
+        // audit_id -- zero at v1.1.0.
+        xor r11, r11;
+        mov [r10 + 16], r11;
+
+        // qname_hash -- r15 accumulator.
+        mov [r10 + 24], r15;
+
+        // qtype (u16=1) | answer_ip (u32=0) | ttl_hi (u16=0) --
+        // packed as u64. Bytes 0..1 = qtype LE = 0x0001;
+        // bytes 2..5 = answer_ip = 0; bytes 6..7 = ttl_hi = 0.
+        mov r11, 0x0000000000000001;
+        mov [r10 + 32], r11;
+
+        // ttl_lo|cname_hops|txn_id|result_code|reserved -- packed as
+        // u64. Loaded from .rodata constant pdxdig_dqr_result_dry_run_tail
+        // (documented at the constant declaration).
+        mov r11, [rip + pdxdig_dqr_result_dry_run_tail];
+        mov [r10 + 40], r11;
+
+        // ---- Step 4: sys_semantic_send(schema, rec_ptr, rec_len).
+        //              SC+ ID 115. Schema tag movabs; rec_len = 48.
+        mov rdi, 0x446E735172797201;             // schema tag (DnsQry@0.1)
+        lea rsi, [rip + pdxdig_record_buf];
+        mov rdx, 48;                             // rec_len fits [1, 240]
+        mov rax, 115;
+        syscall;
+        // Return value intentionally not inspected -- see justification.
+
+        // ---- Step 5: STUB body for the query itself -- fail-closed
+        //              with `pdxdig: udp stub\n` on fd 2, exit 3. The
+        //              M2-001 landing replaces this tail with the real
+        //              UDP query + response-walker path.
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxdig_msg_udp_stub];
+        mov rdx, 17;                             // pdxdig_msg_udp_stub_len
+        mov rax, 1;                              // SC+ ID 1 = sys_write
+        syscall;
+        mov rdi, 3;                              // exit status = 3
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxdig_usage:
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + pdxdig_msg_usage];
+        mov rdx, 14;                             // pdxdig_msg_usage_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;                              // exit status = 2 (usage)
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

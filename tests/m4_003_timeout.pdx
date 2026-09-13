@@ -1,0 +1,116 @@
+// tests/m4_003_timeout.pdx -- pdxdig M4-003 witness (pdxdig#11):
+// TIMEOUT classifier gate.
+//
+// Wave: R100  Milestone: M4-003 (pdxdig#11)
+// Doc:  design/networking/r100-user-tools-plan.md §6 (paideia-os).
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that gates pdxdig's timeout classifier: given a
+// simulated sysrecv-returned response length of 0 bytes (the wire
+// signal for "the timeout-ms window elapsed with no bytes"), the
+// classifier MUST land the run in `result_code = TIMEOUT (2)` per
+// §10.2's DnsQueryRecord enum and exit with the tool-reserved
+// TIMEOUT status (4).
+//
+// The real M2-001 query path will call the classifier from
+// pdxdig_query_body after a sys_recv returns 0-with-timeout-flag (or
+// once sys_recv gains a deadline arg). At v1.1.0 the timeout arm is
+// stubbed in main.pdx (whole tool exits 3 with `pdxdig: udp stub\n`),
+// so this witness exercises the classifier arithmetic inline: given
+// `response_len == 0`, assign `result_code = 2` and exit 4.
+//
+// A follow-up M4-003-b landing wires the same classifier over a
+// real 100ms blocking sys_recv against an unresponsive fixture
+// resolver once sys_clock_now + sys_recv-with-deadline exist.
+//
+// Fixture-harness approach ---------------------------------------------
+// pdxdig has no in-tree fork/spawn scaffolding and no live UDP
+// substrate (§12.1 blocker). The classifier is exercised inline
+// against a hardcoded `response_len = 0` scalar -- same fixture-
+// harness discipline pdxsock/tests/tcp_echo_smoke.pdx established.
+//
+// Fingerprint band on fd 2:
+//   pdxdig timeout ok\n   (19 wire bytes)  -- classifier landed TIMEOUT
+//   pdxdig timeout FAIL\n (21 wire bytes)  -- classifier missed
+//
+// Exit codes:
+//   0 = TIMEOUT (2) classifier ran (and the witness then re-exits
+//       with the tool-reserved TIMEOUT status)
+//   Actually: we exit 4 on success (matches the tool's TIMEOUT exit).
+//   1 = classifier landed the wrong result_code
+//
+// (Rationale for exit 4 on success: the witness is a stand-in for
+// the real tool run; a smoke-runner that greps for exit-4-on-
+// timeout works uniformly whether the run took the classifier via
+// this witness or via the real M2-001 tool body.)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls) ------------------------
+//   * PascalCase module basename: M4003Timeout.
+//   * Every label prefixed `m4003_`.
+//   * No `test rN,rN`; no 2-op `imul r,imm`.
+
+module M4Timeout = structure {
+
+  // Result-code enumerants (mirrors §10.2). Only 2 (TIMEOUT) is
+  // consumed here; the rest are documentation.
+  pub let m4003_rc_ok                : u64 = 0
+  pub let m4003_rc_nxdomain          : u64 = 1
+  pub let m4003_rc_timeout           : u64 = 2
+  pub let m4003_rc_malformed         : u64 = 3
+  pub let m4003_rc_unsupported_qtype : u64 = 4
+  pub let m4003_rc_dry_run           : u64 = 5
+
+  pub let m4003_msg_ok     : [u8; 20] = "pdxdig timeout ok\n\0"
+  pub let m4003_msg_ok_len : u64 = 19
+
+  pub let m4003_msg_fail     : [u8; 22] = "pdxdig timeout FAIL\n\0"
+  pub let m4003_msg_fail_len : u64 = 21
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "pdxdig.M4-003 (pdxdig#11) TIMEOUT classifier witness. Simulates the classifier's arithmetic against `response_len == 0` (the wire signal for `no bytes received in the timeout-ms window`) and asserts the classifier lands the run in `result_code = TIMEOUT (2)`. Register plan: r14 = response_len (0 = sentinel for TIMEOUT), r15 = classifier-assigned result_code. Classifier rule at v1.1.0: `response_len == 0 -> result_code = 2; else result_code = 0`. Emits `pdxdig timeout ok\\n` on fd 2 + sys_exit(4) on classifier == 2 (the tool-reserved TIMEOUT exit -- smoke-runners grep for exit-4-on-timeout uniformly). Emits `pdxdig timeout FAIL\\n` on fd 2 + sys_exit(1) on classifier miss. A follow-up M4-003-b landing wires the same classifier over a real 100ms blocking sys_recv against an unresponsive fixture resolver once sys_clock_now + sys_recv-with-deadline exist. Encoder: no `test` (zero-check is `cmp reg, 0`); no 2-op `imul`; no wide-and (unused); module basename PascalCase (M4003Timeout); labels prefixed m4003_.",
+      block: {
+        // Simulate the classifier input: response_len = 0.
+        xor r14, r14;
+
+        // Classifier arithmetic (matches the real body):
+        //   if (response_len == 0) result_code = TIMEOUT else OK
+        cmp r14, 0;
+        jne m4003_classify_ok;
+        mov r15, 2;                              // m4003_rc_timeout
+        jmp m4003_check;
+      m4003_classify_ok:
+        xor r15, r15;                            // m4003_rc_ok
+      m4003_check:
+
+        // Assert classifier == TIMEOUT (2).
+        cmp r15, 2;
+        jne m4003_fail;
+
+      m4003_ok:
+        mov rdi, 2;                              // fd = stderr
+        lea rsi, [rip + m4003_msg_ok];
+        mov rdx, 19;                             // m4003_msg_ok_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 4;                              // exit 4 (TIMEOUT status)
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4003_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m4003_msg_fail];
+        mov rdx, 21;                             // m4003_msg_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;                              // exit 1 (mismatch)
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

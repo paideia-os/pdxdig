@@ -1,0 +1,17 @@
+# pdxdig -- deps.list
+#
+# Format: one-per-line `<dep> <constraint>` (paideia-os satellite-tool
+# convention; mirrors pdxsock/deps.list shape).
+#
+# pdxdig at v1.1 has no library-external dependencies beyond the SC+
+# syscall floor (sysnos 0/1/60 read/write/exit + 115 sys_semantic_send).
+# The UDP query path (sendto/recvfrom, sysnos 96/97) is blocked on
+# §12.1 and lands at M2-001; libpdx-net will be pulled in as a
+# `deps:` entry at that milestone. libpdx-argv is not consumed at
+# v1.1 (argv parse is inline in src/main.pdx); PDX_TOOL_NAME +
+# PDX_TOOL_VERSION externs are provided pre-emptively in
+# src/tool_ident.pdx per the libpdx-argv 1.1.3 ENH-032 contract so
+# the eventual bump is a one-line manifest edit.
+
+# libpdx-net    >= 0.1.0   # deferred to pdxdig.M2-001 (real UDP query)
+# libpdx-argv   >= 1.1.3   # deferred; PDX_TOOL_NAME contract pre-satisfied

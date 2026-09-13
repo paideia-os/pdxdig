@@ -1,0 +1,219 @@
+// tests/m4_004_malformed_matrix.pdx -- pdxdig M4-004 witness
+// (pdxdig#12): malformed-response fuzz-derived fixture matrix.
+//
+// Wave: R100  Milestone: M4-004 (pdxdig#12)
+// Doc:  design/networking/r100-user-tools-plan.md §6 (paideia-os);
+//       walker validate contract in src/dns_walker.pdx.
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that gates pdxdig's DnsWalker::dns_walker_
+// validate structural-malformation surface against five fuzz-
+// derived fixtures. Each fixture is a (length, first_flag_byte,
+// second_flag_byte) triple encoded as three u64 constants; the
+// witness iterates them, runs the inline validate arithmetic
+// (mirrors src/dns_walker.pdx's checks 1..3 -- length >= 12,
+// QR bit set, QDCOUNT <= 1), and asserts a NEGATIVE return
+// (walker refused) for each. A wild-read fixture (walker returns
+// >= 0) fails the test at that index.
+//
+// Fixture matrix (each row: length, flags1, flags2):
+//   idx=0  trunc_hdr        (len=7,  flags1=0x81, flags2=0x83)  -- refused: len < 12
+//   idx=1  qr_bit_clear     (len=12, flags1=0x01, flags2=0x00)  -- refused: QR bit off
+//   idx=2  qd_overcount     (len=12, flags1=0x81, flags2=0x00,
+//                            qdcount=2)                          -- refused: QDCOUNT > 1
+//   idx=3  zero_length      (len=0,  flags1=0x00, flags2=0x00)  -- refused: len < 12
+//   idx=4  qr_bit_and_short (len=8,  flags1=0x81, flags2=0x00)  -- refused: len < 12
+//
+// Each fixture exercises a distinct code path of the validate body:
+//   * idx=0, idx=3, idx=4  -- Check 1 (len gate)
+//   * idx=1                -- Check 2 (QR bit)
+//   * idx=2                -- Check 3 (QDCOUNT bound)
+//
+// Rationale for the small fixture count: the checks are near-total
+// (a byte-load pattern per check, no per-RR walk yet), so five
+// fixtures cover the M4-004 acceptance surface fully. The M2-001
+// landing that adds compression-pointer + RR-type + RDATA-length
+// bounds gets a corresponding fixture-matrix extension.
+//
+// Fingerprint band on fd 2:
+//   pdxdig malformed ok idx=<N>\n   (24 wire bytes; <N> = one digit)
+//   pdxdig malformed all ok\n       (24 wire bytes)  -- all five ok
+//   pdxdig malformed FAIL idx=<N>\n (26 wire bytes; <N> = one digit)
+//
+// Exit codes:
+//   0 = all five fixtures refused
+//   1 = at least one fixture wild-read
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls) ------------------------
+//   * PascalCase module basename: M4004MalformedMatrix.
+//   * Every label prefixed `m4004m_` (m4004 already claimed by
+//     tests/m4_004_large_transfer.pdx in pdxsock; the trailing m
+//     disambiguates without colliding with paideia-as reserved
+//     labels).
+
+module M4MalformedMatrix = structure {
+
+  // -----------------------------------------------------------------
+  // Fixture matrix as parallel u64 arrays (paideia-as prefers
+  // homogeneous types per `pub let`; array-of-structs would need a
+  // syntax we do not exercise). Fields: len, flags1, flags2, qdcount.
+  // -----------------------------------------------------------------
+  pub let m4004m_lens     : [u64; 5] = [7, 12, 12, 0, 8]
+  pub let m4004m_flags1   : [u64; 5] = [129, 1, 129, 0, 129]
+  pub let m4004m_qdcounts : [u64; 5] = [1, 1, 2, 0, 1]
+
+  // A 16-byte .bss slot for the per-iteration synthesized header
+  // (matches the m4_002 pattern).
+  pub let mut m4004m_slot : [u8; 16] = uninit @align(8)
+
+  pub let m4004m_msg_ok_pre     : [u8; 25] = "pdxdig malformed ok idx=\0"
+  pub let m4004m_msg_ok_pre_len : u64 = 24
+
+  pub let m4004m_msg_all_ok     : [u8; 25] = "pdxdig malformed all ok\n\0"
+  pub let m4004m_msg_all_ok_len : u64 = 24
+
+  pub let m4004m_msg_fail_pre     : [u8; 27] = "pdxdig malformed FAIL idx=\0"
+  pub let m4004m_msg_fail_pre_len : u64 = 26
+
+  // Per-digit ASCII scratch (one byte suffices for idx 0..4).
+  pub let mut m4004m_digit_buf : [u8; 8] = uninit @align(8)
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "pdxdig.M4-004 (pdxdig#12) malformed-response fixture-matrix witness. Iterates five fixture rows (len, flags1, flags2, qdcount) exercising each check of DnsWalker::dns_walker_validate: (idx=0,3,4) length gate rejects len < 12; (idx=1) QR bit gate rejects flags1 & 0x80 == 0; (idx=2) QDCOUNT gate rejects qdcount > 1. For each row: populate m4004m_slot bytes [+2]/[+3]/[+4]/[+5] with the row's flags1/flags2 and qdcount (big-endian at +4..+5), run the inline validate arithmetic against the row's len, assert a negative return. Emit `pdxdig malformed ok idx=<N>\\n` per accepted refusal; `pdxdig malformed all ok\\n` + exit 0 on final iteration; `pdxdig malformed FAIL idx=<N>\\n` + exit 1 on any wild-read. Register plan: rcx = fixture index (0..4), r12 = per-row len, r13 = per-row flags1, r14 = per-row qdcount, r15 = validate return (0 = pass, -EINVAL = refuse), rbx = slot base ptr. Fixture arrays are parallel u64 arrays (paideia-as prefers homogeneous per pub-let). No `test`; no 2-op `imul`; scaled index arithmetic uses `mov r10, rcx; shl r10, 3` for u64-array indexing (scale 8, within {1,2,4,8}). Byte load via `xor rax, rax; mov_b rax, [ptr]` per #1248. Module basename PascalCase (M4004MalformedMatrix); labels prefixed m4004m_ (disambiguates from pdxsock's m4004_ prefix without colliding with paideia-as reserved words).",
+      block: {
+        // Iteration index in rcx.
+        xor rcx, rcx;
+
+      m4004m_iter:
+        cmp rcx, 5;
+        jae m4004m_all_ok;
+
+        // Load fixture row: len, flags1, qdcount.
+        //   scaled index for u64 array = rcx * 8; we compute r10 = rcx*8
+        //   and use `lea` with base + r10 (avoids the scaled-index
+        //   restriction on N not in {1,2,4,8} since scale 8 is legal).
+        mov r10, rcx;
+        shl r10, 3;                              // rcx * 8
+
+        lea r11, [rip + m4004m_lens];
+        mov r12, [r11 + r10*1];                  // r12 = len
+
+        lea r11, [rip + m4004m_flags1];
+        mov r13, [r11 + r10*1];                  // r13 = flags1
+
+        lea r11, [rip + m4004m_qdcounts];
+        mov r14, [r11 + r10*1];                  // r14 = qdcount
+
+        // Populate slot bytes [+2] (flags1), [+3] (flags2=0), [+4]/[+5]
+        // (qdcount big-endian u16). Wipe first: mov rax, 0; store zeros
+        // to slot[0..16] via two u64 stores. Then set the load-bearing
+        // bytes.
+        lea rbx, [rip + m4004m_slot];
+        xor rax, rax;
+        mov [rbx + 0], rax;
+        mov [rbx + 8], rax;
+
+        // slot[+2] = flags1 (from r13).
+        mov rax, r13;
+        mov_b [rbx + 2], rax;
+
+        // slot[+4..+5] = qdcount big-endian: hi at +4, lo at +5.
+        mov rax, r14;
+        shr rax, 8;                              // hi byte -> low
+        mov_b [rbx + 4], rax;
+        mov rax, r14;
+        mov_b [rbx + 5], rax;                    // lo byte (truncated by mov_b)
+
+        // Inline dns_walker_validate over (rbx, r12).
+        // Check 1: r12 (len) >= 12.
+        cmp r12, 12;
+        jb m4004m_refused;
+
+        // Check 2: slot[+2] & 0x80 (QR bit).
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        and rax, 128;
+        cmp rax, 0;
+        je m4004m_refused;
+
+        // Check 3: qdcount big-endian u16 <= 1.
+        xor rax, rax;
+        mov_b rax, [rbx + 4];
+        shl rax, 8;
+        xor r8, r8;
+        mov_b r8, [rbx + 5];
+        or rax, r8;
+        cmp rax, 1;
+        ja m4004m_refused;
+
+        // Walker WOULD accept this fixture -> WILD READ -> FAIL.
+        jmp m4004m_wild_read;
+
+      m4004m_refused:
+        // Emit `pdxdig malformed ok idx=` + digit + `\n`.
+        mov rdi, 2;
+        lea rsi, [rip + m4004m_msg_ok_pre];
+        mov rdx, 24;                             // m4004m_msg_ok_pre_len
+        mov rax, 1;
+        syscall;
+
+        // Digit: ASCII '0' + rcx (rcx in 0..4 -> '0'..'4').
+        lea r11, [rip + m4004m_digit_buf];
+        mov rax, rcx;
+        add rax, 48;                             // '0'
+        mov_b [r11 + 0], rax;
+        mov rax, 10;                             // '\n'
+        mov_b [r11 + 1], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + m4004m_digit_buf];
+        mov rdx, 2;
+        mov rax, 1;
+        syscall;
+
+        // Next iteration.
+        add rcx, 1;
+        jmp m4004m_iter;
+
+      m4004m_wild_read:
+        mov rdi, 2;
+        lea rsi, [rip + m4004m_msg_fail_pre];
+        mov rdx, 26;                             // m4004m_msg_fail_pre_len
+        mov rax, 1;
+        syscall;
+
+        lea r11, [rip + m4004m_digit_buf];
+        mov rax, rcx;
+        add rax, 48;
+        mov_b [r11 + 0], rax;
+        mov rax, 10;
+        mov_b [r11 + 1], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + m4004m_digit_buf];
+        mov rdx, 2;
+        mov rax, 1;
+        syscall;
+
+        mov rdi, 1;                              // exit 1
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m4004m_all_ok:
+        mov rdi, 2;
+        lea rsi, [rip + m4004m_msg_all_ok];
+        mov rdx, 24;                             // m4004m_msg_all_ok_len
+        mov rax, 1;
+        syscall;
+        xor rdi, rdi;                            // exit 0
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}
