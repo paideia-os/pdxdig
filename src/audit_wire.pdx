@@ -1,0 +1,127 @@
+// src/audit_wire.pdx -- pdxdig M3-001 libpdx-audit integration (STUB)
+// (pdxdig#7).
+//
+// Wave: R100  Milestone: M3-001 (pdxdig#7)
+// Doc:  design/networking/r100-user-tools-plan.md §13.6 (paideia-os)
+//       + libpdx-audit/src/audit_file_sink.pdx (real API this stub
+//       mirrors the shape of).
+//
+// Purpose ---------------------------------------------------------------
+// AuditWire is pdxdig's single-file surface for the audit-journal
+// integration §13.6 names: once per accepted DNS query, append a
+// compact fingerprint line (query name + qtype + result rcode) to
+// `/system/audit/pdxdig.log` via libpdx-audit's
+// `AuditFileSink::audit_file_append(path_ptr, path_len, line_ptr,
+// line_len) -> u64` -- a durable, human-tail-able transport
+// independent of whether the audit-journal broker daemon is up (see
+// that file's own header for the full rationale).
+//
+// The one pub-let entry point defined here --
+// `pdxdig_audit_log_query` -- is the callable surface Main::_start's
+// `_start` calls once per argv-accepted invocation, immediately
+// after the `sys_semantic_send` emission and before terminal
+// dispatch (see src/main.pdx "Step 5b"). Its argument ABI is FROZEN
+// at this landing so a future landing that swaps the STUB body for a
+// real `audit_file_append` call needs touch only THIS file.
+//
+// STUB status (M3-001 landing) -------------------------------------
+// `paideia-os/libpdx-audit` is not yet in pdxdig's `manifest.pdxproj`
+// `deps:` list, and (matching pdxsock's own M3-002 AuditWire
+// precedent, src/audit_wire.pdx in that repo) `tools/build.sh` links
+// every `src/*.o` in THIS repo into one flat ELF with
+// `--fatal-warnings` -- an unresolved `call audit_file_append` here
+// would break every build until libpdx-audit is wired, not just this
+// call site. Until that dep lands, `pdxdig_audit_log_query` executes
+// a no-op body -- `xor rax, rax; ret` -- and returns 0 (matching
+// libpdx-audit's `AFS_OK = 0` convention). `main.pdx`'s call site
+// discards the return value entirely (audit-not-wired is
+// indistinguishable from audit-succeeded at this landing, same
+// posture pdxsock's AuditWire STUB documents).
+//
+// Effects declaration --------------------------------------------------
+// Declared effect/cap set is `!{mem, sysreg} @{cap, sched}` -- the
+// same set the real body will require once it calls
+// `AuditFileSink::audit_file_append` (that function issues raw
+// sys_open/sys_write/sys_close syscalls, i.e. {mem, sysreg} effects
+// under {fs, sched} capabilities gated by KIND_USER attribution --
+// see that file's own header). Declaring the wider set now means the
+// swap-to-real landing changes only body bytes, not the pub-let
+// signature. `_start` already declares `!{mem, sysreg} @{fs, sched,
+// cap}`, a superset, so the call is well-typed under the pdxdig
+// effect algebra.
+//
+// Future real body will ----------------------------------------------
+//   * format a compact ASCII line into a module-level `.bss` scratch
+//     buffer: `pdxdig q=<qname_hash hex> qtype=<T> rcode=<R>\n`
+//     (query NAME bytes themselves are not durably logged at this
+//     sketch -- the rolling qname_hash Main::_start already computes
+//     is a sufficient fingerprint for audit-trail correlation
+//     without duplicating the full argv string into a second buffer;
+//     a future revision may append the raw name if a reviewer needs
+//     it verbatim)
+//   * call `AuditFileSink::audit_file_append(path_ptr =
+//     "/system/audit/pdxdig.log", path_len = 24, line_ptr, line_len)`
+//   * return that call's raw u64 (0 = AFS_OK, positive = raw errno,
+//     36 = ENAMETOOLONG, 5 = EIO per that file's documented contract)
+//
+// Encoder discipline (per user memory `pdx encoder pitfalls`) -----------
+//   * no `test rN, rN` (unused at STUB level)
+//   * no 2-op `imul r, imm` (unused)
+//   * no `and reg, imm64` on r8..r15 (unused)
+//   * PascalCase module basename (`AuditWire` from `audit_wire.pdx`)
+//   * every label prefixed `aw_` (no branch labels needed at STUB
+//     level, so this is trivially satisfied)
+//   * <= 4 curried args (`pdxdig_audit_log_query` takes exactly 3)
+//   * SysV push/pop parity: leaf body touches no stack
+
+module AuditWire = structure {
+
+  // Path pdxdig's future real body targets. Documentation-only at
+  // STUB level (the STUB body does not read it) -- present so
+  // `grep AUDIT_PATH` in this tree surfaces the wire-visible target
+  // at any git-blame moment, mirroring PSAW_EVENT_* in pdxsock's own
+  // AuditWire.
+  pub let AW_AUDIT_LOG_PATH     : [u8; 25] = "/system/audit/pdxdig.log\0"
+  pub let AW_AUDIT_LOG_PATH_LEN : u64 = 24
+
+  // -------------------------------------------------------------------
+  // pdxdig_audit_log_query(qname_ptr, qtype, result_code) -> u64
+  //
+  //   rdi = qname_ptr    (argv positional pointer; NUL-terminated.
+  //                        STUB discards it -- the future real body
+  //                        threads it into the compact fingerprint
+  //                        line, see file header)
+  //   rsi = qtype        (u64; 1 = A at pdxdig v1.x -- STUB discards)
+  //   rdx = result_code  (u64; DnsQueryRecord@0.1 result_code enum
+  //                        value per src/main.pdx -- STUB discards)
+  //   rax = 0 on success (STUB always returns 0 = AFS_OK)
+  //
+  // Called from Main::_start once per argv-accepted invocation,
+  // immediately after the `sys_semantic_send` record emission (see
+  // src/main.pdx "Step 5b"). Discards every argument at STUB level.
+  //
+  // Register discipline: pure leaf, no callee-save touched. `rax` is
+  // the only write. `rdi`/`rsi`/`rdx` (args) are caller-save -- the
+  // caller's post-call value for them is immaterial.
+  // -------------------------------------------------------------------
+  pub let pdxdig_audit_log_query : (u64, u64, u64) -> u64
+    !{mem, sysreg} @{cap, sched} =
+    fn (qname_ptr: u64) (qtype: u64) (result_code: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "pdxdig.M3-001 (pdxdig#7) libpdx-audit integration STUB. paideia-os/libpdx-audit is not yet in pdxdig's manifest.pdxproj deps at this landing -- see file header on the fatal-warnings flat-link constraint (identical to pdxsock's own M3-002 AuditWire precedent, tools/user/pdxsock/src/audit_wire.pdx). STUB body is `xor rax, rax; ret`: sets the AFS_OK (0) return, no memory or sysreg touch. Declared effect set !{mem, sysreg} @{cap, sched} intentionally mirrors what the swap-to-real body will require (AuditFileSink::audit_file_append issues sys_open/sys_write/sys_close per libpdx-audit/src/audit_file_sink.pdx) so Main::_start's caller-side call encoding survives the swap without re-typing. Arg ABI frozen: rdi = qname_ptr (argv positional, NUL-terminated), rsi = qtype (u64, 1=A at v1.x), rdx = result_code (u64, DnsQueryRecord@0.1 enum value). Return value 0 at STUB matches libpdx-audit's AFS_OK sentinel; the future real body returns audit_file_append's raw u64 (0 / positive errno / 36 ENAMETOOLONG / 5 EIO). Register discipline: pure leaf -- writes only rax, touches no callee-save, needs no push/pop, needs no stack. rdi/rsi/rdx (caller-save args) may be freely trashed by any future body. Encoder: `xor rN, rN` for the zero-return (valid REX.W pair on rax); `ret` is 0xC3 -- SysV stack posture at entry is rsp%16==8 (post-call from Main::_start, which never pushes before this call site, so entry rsp%16==0 there and the call itself supplies the +8), and since this leaf touches no stack it exits with the same posture. No `test`, no 2-op `imul`, no `and reg, imm64` on r8..r15 -- STUB body uses none of them. <=4 curried args (exactly 3). Label prefix aw_ per user memory -- no branch labels in this body, so the requirement is trivially satisfied.",
+      block: {
+        // STUB(libpdx-audit): swap this body for a real
+        // fingerprint-format + `audit_file_append` call once
+        // libpdx-audit lands in pdxdig's `deps:` and pdxdig's
+        // `caps.decl` acquires whatever grant that call needs. Until
+        // then, no-op returning AFS_OK (0) so the caller's post-call
+        // (currently: nothing, per src/main.pdx Step 5b) treats
+        // "audit not wired" as indistinguishable from "audit
+        // succeeded".
+        xor rax, rax;
+        ret;
+      }
+    }
+
+}

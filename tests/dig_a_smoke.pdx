@@ -1,0 +1,186 @@
+// tests/dig_a_smoke.pdx -- pdxdig M4-001 witness (pdxdig#9):
+// happy-path A-record lookup vs. a mocked resolver reply.
+//
+// Wave: R100  Milestone: M4-001 (pdxdig#9)
+// Doc:  design/networking/r100-user-tools-plan.md §6 (paideia-os);
+//       WEAK-stub net_resolve contract in src/dig_query.pdx
+//       (pdxdig#4, M2-001).
+//
+// Purpose ---------------------------------------------------------------
+// Boot-smoke witness that gates pdxdig's happy-path A-record answer
+// extraction: given a mocked resolver reply for `example.com` whose
+// A-record RDATA is 93.184.216.34, the extraction MUST surface those
+// exact four bytes. Real UDP query (§12.1 blocker, see
+// src/dig_query.pdx) is not exercised -- this witness mocks the
+// resolver reply via a test-local WEAK stub shaped exactly like the
+// real `net_resolve(host_ptr, host_len, qtype, out_addr) -> u64`
+// extern that file documents, so the same call shape a future real
+// query-path landing uses is exercised end to end here (minus the
+// actual UDP round-trip).
+//
+// Fixture-harness approach ---------------------------------------------
+// pdxdig has no in-tree fork/spawn scaffolding and no live UDP
+// substrate (§12.1 blocker), so the fixture is a 256-byte .bss buffer
+// populated at _start (mirrors tests/m4_002_nxdomain.pdx's runtime-
+// fill pattern). Only the answer RDATA slot at [+241..+244] carries
+// load-bearing bytes for this witness -- the DNS header parse and
+// RR-name/RDLENGTH walk are exercised standalone by
+// tests/m4_002_nxdomain.pdx and tests/m4_004_malformed_matrix.pdx
+// respectively.
+//
+// Fixture layout (256-byte fake DNS response, .bss @align(8)):
+//   [+0..+11]    DNS header scaffold (left zero -- .bss; not
+//                independently re-validated here).
+//   [+12..+240]  question ("example.com") + answer-RR name/type/
+//                class/ttl/rdlength scaffold (left zero -- .bss; not
+//                read by this witness).
+//   [+241..+244] answer RDATA -- the 4-byte A-record payload for
+//                example.com: 93.184.216.34 (the address commonly
+//                used for example.com in RFC 5737/6890-adjacent
+//                documentation corpora).
+//   [+245..+255] trailer padding (.bss zero).
+//
+// Fingerprint band on fd 2:
+//   pdxdig a-record ok 93.184.216.34\n  (33 wire bytes) -- success
+//   pdxdig a-record FAIL\n              (21 wire bytes) -- mismatch
+//
+// Exit codes:
+//   0 = stub-resolved 4 bytes == 93.184.216.34
+//   1 = stub call failed OR resolved bytes mismatched
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls) ------------------------
+//   * PascalCase module basename: DigASmoke.
+//   * Every label prefixed `m9_`.
+//   * No `test rN,rN`; no 2-op `imul r,imm`; no wide-and on r8..r15;
+//     no `neg`; no sil/dil/bl aliases; <=4 curried args.
+//   * Byte load via `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   * Byte store via `mov rax, imm; mov_b [ptr + N], rax`.
+
+module DigASmoke = structure {
+
+  // 256-byte .bss fixture (fake DNS response). Only [+241..+244]
+  // carry load-bearing bytes -- see file header.
+  pub let mut m9_fixture : [u8; 256] = uninit @align(8)
+
+  // Resolved-answer scratch the stub writes into -- mirrors the real
+  // net_resolve(host_ptr, host_len, qtype, out_addr) 4th out-param
+  // (src/dig_query.pdx, pdxdig#4).
+  pub let mut m9_resolved : [u8; 4] = uninit @align(8)
+
+  pub let m9_msg_ok      : [u8; 34] = "pdxdig a-record ok 93.184.216.34\n\0"
+  pub let m9_msg_ok_len  : u64 = 33
+
+  pub let m9_msg_fail     : [u8; 22] = "pdxdig a-record FAIL\n\0"
+  pub let m9_msg_fail_len : u64 = 21
+
+  // -------------------------------------------------------------------
+  // m9_net_resolve_stub(host_ptr, host_len, qtype, out_addr) -> u64
+  //
+  // Test-local WEAK stub shaped exactly like the real net_resolve
+  // extern src/dig_query.pdx documents (pdxdig#4). Ignores every
+  // input arg (fixed fixture: "example.com" -> A) and copies the
+  // canned 4-byte answer from m9_fixture[+241..+244] into
+  // [out_addr..+3], returning 0 (success) unconditionally -- unlike
+  // DigQuery::dig_query_resolve's 0xDEADBEEF sentinel, THIS stub
+  // returns a concrete fixture answer so the happy-path extraction
+  // has a real value to assert against (the two stubs serve
+  // different purposes: dig_query_resolve documents "no resolver
+  // exists yet", this one documents "here is what a resolver
+  // WOULD have answered").
+  //
+  // Pure leaf: rdi=host_ptr, rsi=host_len, rdx=qtype, rcx=out_addr.
+  // -------------------------------------------------------------------
+  pub let m9_net_resolve_stub : (u64, u64, u64, u64) -> u64
+    !{mem} @{} =
+    fn (host_ptr: u64) (host_len: u64) (qtype: u64) (out_addr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxdig.M4-001 (pdxdig#9) DigASmoke::m9_net_resolve_stub. Test-local mock of the real net_resolve(host_ptr, host_len, qtype, out_addr) extern src/dig_query.pdx documents (pdxdig#4, M2-001, BLOCKED on §12.1). Ignores host_ptr/host_len/qtype (fixed fixture -- example.com A lookup); copies the 4 RDATA bytes at m9_fixture[+241..+244] (93,184,216,34, populated by _start before this is called) into [rcx+0..+3] via four `xor rax,rax; mov_b rax,[r9+N]; mov_b [rcx+N],rax` byte transfers, then returns 0 unconditionally (success). Pure leaf: no callee-save touch, no push/pop, no stack use. Encoder discipline: no `test` (unused); no 2-op `imul` (unused); no wide-and (unused); byte transfer via the #1248-safe xor+mov_b idiom; <=4 curried args (exactly 4, at the ceiling); module basename DigASmoke matches file stem dig_a_smoke.pdx; labels prefixed m9_ (none needed in this leaf body).",
+      block: {
+        lea r9, [rip + m9_fixture];
+        xor rax, rax;
+        mov_b rax, [r9 + 241];
+        mov_b [rcx + 0], rax;
+        xor rax, rax;
+        mov_b rax, [r9 + 242];
+        mov_b [rcx + 1], rax;
+        xor rax, rax;
+        mov_b rax, [r9 + 243];
+        mov_b [rcx + 2], rax;
+        xor rax, rax;
+        mov_b rax, [r9 + 244];
+        mov_b [rcx + 3], rax;
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "pdxdig.M4-001 (pdxdig#9) happy-path A-record lookup vs. a mocked resolver reply. Populates m9_fixture[+241..+244] with the example.com A-record RDATA bytes (93,184,216,34) via `mov rax, imm; mov_b [rbx+N], rax` per the m4_004/m4_002 fill-loop idiom, then invokes m9_net_resolve_stub (shaped exactly like the real net_resolve(host_ptr,host_len,qtype,out_addr) extern) with rcx = &m9_resolved as the out-param, asserting a 0 return. Then re-reads m9_resolved[0..3] and compares each byte against the expected constants (93/184/216/34) via `xor rax,rax; mov_b rax,[rbx+N]; cmp rax, K; jne m9_fail`. All four bytes matching emits `pdxdig a-record ok 93.184.216.34\\n` (33 wire bytes) on fd 2 + sys_exit(0); any mismatch (stub non-zero return OR a byte mismatch) emits `pdxdig a-record FAIL\\n` (21 wire bytes) on fd 2 + sys_exit(1). Register plan: rbx = fixture/resolved base ptr (reloaded per phase via lea), rax = per-byte scratch, rcx = out_addr arg to the nested call. Entry rsp%16==0 (PVH loader / raw ELF _start contract, matching every other test in this tree); no push/pop anywhere in this body, so the single nested `call m9_net_resolve_stub` fires with rsp%16==0 immediately before it, matching the sysv-push-pop-parity discipline. Encoder: no `test` (cmp reg,0/imm throughout); no 2-op `imul` (unused); no wide-and on r8..r15 (unused); no `neg` (unused); byte loads via `xor rax,rax; mov_b rax,[ptr]` per paideia-as #1248; byte stores via `mov rax, imm; mov_b [rbx+N], rax`; module basename PascalCase (DigASmoke); labels prefixed m9_.",
+      block: {
+        // ---- Populate the fixture's answer RDATA (example.com A). --
+        lea rbx, [rip + m9_fixture];
+        mov rax, 93;
+        mov_b [rbx + 241], rax;
+        mov rax, 184;
+        mov_b [rbx + 242], rax;
+        mov rax, 216;
+        mov_b [rbx + 243], rax;
+        mov rax, 34;
+        mov_b [rbx + 244], rax;
+
+        // ---- Invoke the WEAK-stub net_resolve shape. ----------------
+        lea rcx, [rip + m9_resolved];             // out_addr
+        xor rdi, rdi;                              // host_ptr (unused by stub)
+        xor rsi, rsi;                              // host_len (unused)
+        mov rdx, 1;                                // qtype = A
+        call m9_net_resolve_stub;
+        cmp rax, 0;
+        jne m9_fail;
+
+        // ---- Assert the resolved 4 bytes == 93.184.216.34. ---------
+        lea rbx, [rip + m9_resolved];
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 93;
+        jne m9_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 184;
+        jne m9_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 216;
+        jne m9_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 3];
+        cmp rax, 34;
+        jne m9_fail;
+
+        mov rdi, 2;                                // fd = stderr
+        lea rsi, [rip + m9_msg_ok];
+        mov rdx, 33;                                // m9_msg_ok_len
+        mov rax, 1;
+        syscall;
+        xor rdi, rdi;                               // exit 0
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      m9_fail:
+        mov rdi, 2;
+        lea rsi, [rip + m9_msg_fail];
+        mov rdx, 21;                                // m9_msg_fail_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;                                 // exit 1
+        mov rax, 60;
+        syscall;
+        hlt;
+      }
+    }
+
+}

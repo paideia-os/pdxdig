@@ -12,9 +12,93 @@ Version discipline:
   v1.2.0 -- Wave W drain: argv-surface parser + --dry-run/--type=
              first-runnable branches + M1-001/M3-002 honest witnesses
              (pdxdig#1, #2, #3, #6, #8).
+  v1.3.0 -- Wave GG drain: real --server= IPv4 override, M2-001
+             net_resolve extern scaffold (WEAK stub), M3-001
+             libpdx-audit STUB wire, M4-001 happy-path A-record
+             smoke, release closer (pdxdig#4, #5, #7, #9, #18).
 -->
 
 ## [Unreleased]
+
+## [1.3.0] -- 2026-09-13 -- Wave GG drain
+
+### Added
+- **`--server=` real IPv4 override (pdxdig#5, M2-002).** New
+  `ArgvParse::argv_parse_ipv4(str_ptr) -> u64` leaf in
+  `src/argv_parse.pdx`: byte-scans a dotted-quad, returning a packed
+  MSB-first `u32`-in-`u64` on a well-formed 4-octet value (0..255 per
+  octet, exactly 3 `.` separators) or the all-ones sentinel
+  `0xFFFFFFFFFFFFFFFF` on any malformation (empty octet, octet > 255,
+  wrong octet count, non-digit byte). `Main::_start`'s `--server=`
+  arm now calls this helper on the bytes past the prefix and either
+  stores the packed value into the new module-level
+  `Main::dig_server_override_ip` (+ sets `dig_server_override_set =
+  1`) on success, or folds a malformed value into the same
+  usage-refusal bucket (exit 2) an unknown `-flag` already uses. No
+  real resolver-selection code exists yet to consume the override
+  (that arrives with M2-001) -- this is the argv-surface half of the
+  contract, landed independently per the issue's own scoping.
+
+- **M2-001 UDP-query extern scaffold (pdxdig#4).** New
+  `src/dig_query.pdx` (module `DigQuery`) documents the real
+  `net_resolve(host_ptr, host_len, qtype, out_addr) -> u64` extern
+  contract libpdx-net will expose once R100-PREP-002 / §12.1
+  (kernel-side SOCK_DGRAM extension) unblocks it, and provides
+  `dig_query_resolve` -- a WEAK STUB with the IDENTICAL 4-arg ABI
+  that ignores every input, writes the LE sentinel `0xDEADBEEF` into
+  `[out_addr]` (guarded against a null out-param), and returns
+  `0x00000000DEADBEEF` in `rax`. No bare `call net_resolve` is
+  emitted anywhere in this repo -- `tools/build.sh` links every
+  `src/*.o` into one flat ELF with `--fatal-warnings`, so an
+  unresolved UND symbol would break every build, not just this call
+  site, until libpdx-net actually lands in `deps:` (see file header
+  for the full rationale, matching `paideia-os/mv`'s `ElevateGate`
+  and `pdxsock`'s `AuditWire` precedent). NOT YET called from
+  `Main::_start` -- pdxdig#4 is scoped as "scaffold the wire".
+
+- **M3-001 libpdx-audit STUB wire (pdxdig#7).** New
+  `src/audit_wire.pdx` (module `AuditWire`) with
+  `pdxdig_audit_log_query(qname_ptr, qtype, result_code) -> u64`,
+  called from `Main::_start` once per argv-accepted invocation
+  immediately after the `sys_semantic_send` emission ("Step 5b").
+  Real body (once `libpdx-audit` lands in `deps:`) will format a
+  compact query-name/qtype/rcode fingerprint line and call
+  `AuditFileSink::audit_file_append("/system/audit/pdxdig.log", ...)`
+  -- both documented verbatim in the file header. STUB body is
+  `xor rax, rax; ret` (returns `AFS_OK = 0` unconditionally), same
+  posture as pdxsock's own M3-002 `AuditWire` landing.
+
+- **M4-001 happy-path A-record smoke (pdxdig#9).** New
+  `tests/dig_a_smoke.pdx` (module `DigASmoke`): populates a 256-byte
+  `.bss` fixture's answer-RDATA slot with the `example.com` A-record
+  bytes (93.184.216.34), calls a test-local WEAK stub shaped exactly
+  like the real `net_resolve` extern (`m9_net_resolve_stub`) to copy
+  those bytes into an out-param, asserts the four resolved bytes
+  match, and emits `pdxdig a-record ok 93.184.216.34\n` (33 wire
+  bytes) on fd 2 + exit 0 on match, or `pdxdig a-record FAIL\n` (21
+  wire bytes) + exit 1 on any mismatch.
+
+### Changed
+- `manifest.pdxproj` `version` bumped `1.2.0 -> 1.3.0`; `sources:`
+  gains `src/dig_query.pdx` + `src/audit_wire.pdx`; `tests:` gains
+  `tests/dig_a_smoke.pdx`.
+- `src/tool_ident.pdx` `PDX_TOOL_VERSION` bumped `"1.2.0\0" ->
+  "1.3.0\0"`.
+- `deps.list` documents the `libpdx-audit` deferral alongside the
+  existing `libpdx-net` one.
+- `README.md` documents the real `--server=` parse + the M2-001/M3-001
+  blocker status.
+
+### Release (pdxdig#18, v1.1-C-shaped closer)
+- `release/manifest.pdxsig.txt` (new) -- dual-sign source form,
+  mkfs.pdxfs/pdxsock-template shape. Every `<BLAKE3-*>` /
+  `<...-KID-*>` / `<...-SIG-*>` slot is a documented placeholder the
+  release tool fills in at tag time.
+- `release/RELEASE-1.3.0.md` (new) -- release note + mirror-push
+  runbook, same template pdxsock's `RELEASE-1.2.0.md` establishes.
+- `git tag v1.3.0` (next available semver after the already-tagged
+  v1.1.0 / v1.2.0 -- the issue's own v1.1.0 suggestion predates those
+  tags).
 
 ## [1.2.0] -- 2026-09-13 -- Wave W drain
 

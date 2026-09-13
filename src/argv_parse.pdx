@@ -147,4 +147,100 @@ module ArgvParse = structure {
       }
     }
 
+  // -------------------------------------------------------------------
+  // argv_parse_ipv4(str_ptr) -> u64                          (pdxdig#5)
+  //
+  //   rdi = str_ptr  (NUL-terminated dotted-quad candidate; caller
+  //                    passes arg_ptr + prefix_len, i.e. the bytes
+  //                    AFTER `--server=`)
+  //   rax = packed IPv4 (MSB-first: octet1<<24 | octet2<<16 |
+  //         octet3<<8 | octet4, bits [63:32] always 0 on success)
+  //         on a well-formed 4-octet dotted-quad; ALL-ONES
+  //         (0xFFFFFFFFFFFFFFFF) on any parse failure. All-ones is
+  //         an unambiguous failure sentinel because a successful
+  //         parse never sets any bit above bit 31.
+  //
+  // Grammar: exactly 4 decimal octets (0..255, no leading-zero
+  // rejection -- "007" parses as 7), separated by exactly 3 '.'
+  // bytes, terminated by NUL. Any other byte, an empty octet (e.g.
+  // "1..2.3" or a leading/trailing '.'), an octet > 255, or a wrong
+  // octet count (3 or 5+) fails.
+  //
+  // Used by Main::_start's `--server=` handler (M2-002, pdxdig#5) to
+  // parse the value bypassing the not-yet-real "boot-seeded resolver
+  // config" -- the packed result is stored directly into
+  // `dig_server_override_ip` (Main module, [rip]-addressed).
+  //
+  // Pure leaf, effects: {mem} for the byte-stream read. No callee-
+  // save touch, no push/pop, no stack use -- rsp%16==8 at entry from
+  // a Main::_start `call` is fine for a leaf that never nests.
+  // -------------------------------------------------------------------
+  pub let argv_parse_ipv4 : (u64) -> u64
+    !{mem} @{} =
+    fn (str_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxdig.M2-002 (pdxdig#5) ArgvParse::argv_parse_ipv4. Byte-scans str_ptr for exactly 4 decimal octets (0..255) separated by exactly 3 '.' bytes, NUL-terminated. Register plan: rcx = byte index i, rax = packed accumulator (result), r8 = digit_seen flag (0/1, rejects empty octets), r9 = cur_octet accumulator, r10 = octet_count (dots consumed so far, 0..3), r11 = per-iteration scratch (loaded byte / digit), rsi/rdx = multiply-by-10 scratch (old*8 via shl 3, old*2 via shl 1, summed -- avoids the banned 2-op `imul`). Per byte: NUL -> ap_ip_end_octet_final (requires digit_seen=1 AND octet_count==3, i.e. exactly the 4th octet just finished); '.' (0x2E) -> ap_ip_end_octet_dot (requires digit_seen=1 AND octet_count<3, else fails -- rejects empty octets and a 5th+ octet); digit '0'..'9' (0x30..0x39) -> cur_octet = cur_octet*10 + digit via the shl/add shape, then cmp cur_octet, 255 (ja fail) bounds every octet within at most ~3 further digit-iterations regardless of a pathologically long digit run (no unbounded loop); any other byte -> immediate fail. On a '.' or the final NUL: accum = (accum << 8) | cur_octet, octet_count += 1 (dot path only), cur_octet/digit_seen reset (dot path only). Success returns accum (bits [63:32] always 0 since only 4 octets each <=255 are ever shl'd in); failure returns 0xFFFFFFFFFFFFFFFF (all-ones -- unreachable by any successful parse, so it is a safe caller-side sentinel distinguishable from every valid 0.0.0.0..255.255.255.255 result via `cmp rax, r11` against a register-loaded all-ones constant, matching the DnsWalker -ELOOP/-EINVAL comparison idiom in src/dns_walker.pdx). Pure leaf: no callee-save touch, no push/pop, no stack use. Encoder discipline (pdx encoder pitfalls memo): no `test` (every zero/bound check is `cmp reg, imm` or `cmp reg, reg`); no 2-op `imul` (shl+add substitute per the m2-002 design note); no `and rN, imm64` on r8..r15 (`and` is unused entirely in this function); no `neg`; byte loads via `xor r11, r11; mov_b r11, [rdi + rcx*1]` per paideia-as #1248 (REX.W upper-bits contract) with the explicit `*1` scale (paideia-as U1606 bare-index-operand mitigation, matching this file's own ap_pfx_/ap_eq_ loops); every `cmp` immediate <= 57 except the two all-ones sentinel compares, which load the 64-bit constant into a register first (`mov r11, 0xFFFFFFFFFFFFFFFF`) rather than encoding it as a `cmp` immediate. Labels prefixed ap_ip_. Clobbers rax, rcx, rdx, rsi, r8, r9, r10, r11.",
+      block: {
+        xor rcx, rcx;                            // i = 0
+        xor rax, rax;                             // packed accumulator = 0
+        xor r8, r8;                                // digit_seen = 0
+        xor r9, r9;                                // cur_octet = 0
+        xor r10, r10;                              // octet_count = 0
+
+      ap_ip_loop:
+        xor r11, r11;
+        mov_b r11, [rdi + rcx*1];
+        cmp r11, 0;
+        je ap_ip_end_octet_final;
+        cmp r11, 46;                              // '.'
+        je ap_ip_end_octet_dot;
+        cmp r11, 48;                              // '0'
+        jb ap_ip_fail;
+        cmp r11, 57;                              // '9'
+        ja ap_ip_fail;
+
+        // cur_octet = cur_octet*10 + digit  (shl/add -- no imul)
+        sub r11, 48;                              // r11 = digit
+        mov rsi, r9;
+        shl rsi, 3;                               // rsi = old*8
+        mov rdx, r9;
+        shl rdx, 1;                               // rdx = old*2
+        add rsi, rdx;                             // rsi = old*10
+        add rsi, r11;                             // rsi = old*10 + digit
+        mov r9, rsi;
+        cmp r9, 255;
+        ja ap_ip_fail;
+        mov r8, 1;                                // digit_seen = 1
+        add rcx, 1;
+        jmp ap_ip_loop;
+
+      ap_ip_end_octet_dot:
+        cmp r8, 0;                                // empty octet -> fail
+        je ap_ip_fail;
+        cmp r10, 3;                               // already 3 dots -> 5th octet
+        jae ap_ip_fail;
+        shl rax, 8;
+        or rax, r9;
+        add r10, 1;
+        xor r9, r9;
+        xor r8, r8;
+        add rcx, 1;
+        jmp ap_ip_loop;
+
+      ap_ip_end_octet_final:
+        cmp r8, 0;                                // trailing '.' with no digits
+        je ap_ip_fail;
+        cmp r10, 3;                               // must be exactly 4 octets
+        jne ap_ip_fail;
+        shl rax, 8;
+        or rax, r9;
+        ret;
+
+      ap_ip_fail:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret;
+      }
+    }
+
 }

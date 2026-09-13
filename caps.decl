@@ -9,11 +9,14 @@
 # the parent held none.
 #
 # pdxdig's role: DNS query CLI, `dig`-equivalent (paideia-os design/
-# networking/r100-user-tools-plan.md §6). At v1.1 the real UDP query
-# path is BLOCKED on §12.1 (kernel-side SOCK_DGRAM extension); the
-# tool body still exercises the argv surface, the response walker
-# (CNAME follow, RCODE parse -- pdxdig#13, this wave) and the
-# semantic-pipe emit wire (pdxdig#17, this wave) end to end.
+# networking/r100-user-tools-plan.md §6). At v1.3 the real UDP query
+# path is still BLOCKED on §12.1 (kernel-side SOCK_DGRAM extension,
+# R100-PREP-002) -- src/dig_query.pdx (pdxdig#4) documents the real
+# `net_resolve` extern contract but calls nothing outside this repo
+# yet. The tool body exercises the argv surface (including a REAL
+# --server= IPv4 parse, pdxdig#5), the response walker (CNAME follow,
+# RCODE parse), the semantic-pipe emit wire, and a libpdx-audit STUB
+# wire (pdxdig#7, src/audit_wire.pdx) end to end.
 #
 # Kind rationale:
 #   KIND_USER          -- invoker attribution (audit record identity);

@@ -1,0 +1,144 @@
+// src/dig_query.pdx -- pdxdig M2-001 real UDP query wire scaffold
+// (pdxdig#4). BLOCKED on R100-PREP-002 / design/networking/
+// r100-user-tools-plan.md §12.1 (kernel-side SOCK_DGRAM extension).
+//
+// Wave: R100  Milestone: M2-001 (pdxdig#4)
+// Doc:  design/networking/r100-user-tools-plan.md §6 + §12.1 + §13.5
+//
+// =============================================================================
+// THE BLOCKER (documented per issue instructions)
+// =============================================================================
+//
+// pdxdig's real DNS query path needs a UDP round-trip: send a query
+// packet to the resolver, wait for a response, hand the response to
+// DnsWalker (src/dns_walker.pdx). That round-trip is `libpdx-net`'s
+// job -- the R100 wave's shared resolver library other satellites
+// (pdxcurl, pdxping) also consume. R100-PREP-002 tracks the kernel-
+// side SOCK_DGRAM extension libpdx-net's implementation needs
+// (sendto/recvfrom over a UDP socket kind); until that PREP item
+// lands, libpdx-net cannot expose a real `net_resolve`, and pdxdig
+// cannot link against it.
+//
+// =============================================================================
+// THE REAL EXTERN CONTRACT (documented now so the swap-to-real
+// landing is a body-only edit, not a signature change)
+// =============================================================================
+//
+//   extern net_resolve(host_ptr, host_len, qtype, out_addr) -> u64
+//     rdi = host_ptr   -- query name bytes (NOT required NUL-terminated;
+//                          host_len is authoritative)
+//     rsi = host_len    -- query name byte count
+//     rdx = qtype       -- RR type (1 = A at pdxdig v1.x; libpdx-net's
+//                          resolver parses no other RR type per this
+//                          repo's README)
+//     rcx = out_addr    -- pointer to a 4-byte out-param the callee
+//                          fills with the resolved IPv4 answer (LE
+//                          byte order, matching DnsQueryRecord@0.1's
+//                          own `answer_ip:u32` field in src/main.pdx)
+//     rax = 0 on success, -errno on failure (NXDOMAIN/TIMEOUT/
+//           MALFORMED_RESPONSE map to distinct negative values per
+//           libpdx-net's own contract once it lands -- not yet
+//           finalised at this scaffold landing)
+//
+// =============================================================================
+// WHY THIS FILE DOES NOT EMIT A REAL `call net_resolve`
+// =============================================================================
+//
+// `tools/build.sh` links every `src/*.o` in this repo into ONE flat
+// ELF via `ld -T link.ld --fatal-warnings` (no partial-link, no
+// per-milestone object subset) -- there is no cross-repo link step
+// that would let an unresolved `net_resolve` UND symbol sit dormant
+// until libpdx-net is wired. Emitting a bare `call net_resolve` here
+// today would break EVERY build of this repo, not just the M2-001
+// call site, until libpdx-net lands in `manifest.pdxproj`'s `deps:`
+// list. `paideia-os/mv`'s `ElevateGate` (src/elevate_gate.pdx) and
+// `paideia-os/mkfs.pdxfs`'s own LE-001 landing hit this exact
+// constraint first and resolved it the same way this file does: the
+// real extern signature is documented verbatim (above), the call
+// site's future shape is documented (below), and the callable
+// surface pdxdig actually links today is a WEAK STUB.
+//
+// =============================================================================
+// dig_query_resolve -- the WEAK STUB
+// =============================================================================
+//
+// `dig_query_resolve(host_ptr, host_len, qtype, out_addr) -> u64` is
+// the SAME 4-argument shape as the real `net_resolve` extern above --
+// this is intentional: the day libpdx-net lands in `deps:`, this
+// function's `block:` becomes a single `call net_resolve; ret;` and
+// every caller (main.pdx's future M2-001 dispatch arm) needs zero
+// changes.
+//
+// Until then, the stub ignores every argument (fixed behaviour:
+// there is no real resolver to query) and:
+//   * writes the 4-byte sentinel 0xDEADBEEF (LE: EF BE AD DE) into
+//     `[out_addr]`, UNLESS out_addr == 0 (a not-yet-wired caller
+//     passing a null out-param cannot fault this leaf);
+//   * returns 0xDEADBEEF in rax -- deliberately NOT a small status
+//     code (0 / a small negative errno), so a caller can distinguish
+//     "the stub answered" from "the real net_resolve answered"
+//     without a separate flag. 0xDEADBEEF is also never a routable
+//     unicast IPv4 answer, so it reads unambiguously as a placeholder
+//     wherever it surfaces (a packet trace, a log line, a
+//     DnsQueryRecord@0.1 `answer_ip` field).
+//
+// Call site status: NOT YET WIRED into Main::_start at this landing
+// (pdxdig#4 is scoped as "scaffold the wire", not "wire it up") --
+// the no-flag argv path still exits 3 with `pdxdig: udp stub\n` per
+// v1.2.0 (src/main.pdx). A follow-up M2-001-b landing threads
+// `dig_query_resolve`'s return + out-param into the record marshal
+// and terminal dispatch once the fixed-sentinel-vs-real-answer
+// distinction actually needs to gate behaviour.
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory)
+// ---------------------------------------------------------------
+//   - No `test rN, rN` (every zero-check is `cmp rN, 0`).
+//   - No 2-op `imul r, imm` (unused).
+//   - No `and rN, imm64` on r8..r15 (unused).
+//   - No `neg` mnemonic (unused).
+//   - Byte stores via `mov rax, imm; mov_b [ptr + N], rax`.
+//   - Module basename PascalCase (`DigQuery` for `dig_query.pdx`).
+//   - <= 4 curried args (`dig_query_resolve` takes exactly 4).
+//   - Every label prefixed `dq_`.
+
+module DigQuery = structure {
+
+  // Sentinel documentation constant -- not memory-loaded (the body
+  // hardcodes the four LE bytes + the movabs literal directly),
+  // matching the "constants as human-readable labels" convention
+  // AuditFileSink::AFS_OK and friends establish.
+  pub let DQ_SENTINEL_ADDR : u64 = 0x00000000DEADBEEF
+
+  // -------------------------------------------------------------------
+  // dig_query_resolve(host_ptr, host_len, qtype, out_addr) -> u64
+  //   rdi = host_ptr, rsi = host_len, rdx = qtype, rcx = out_addr
+  //   rax = 0x00000000DEADBEEF (WEAK STUB sentinel; see file header)
+  //
+  // Pure leaf, effects: {mem} for the conditional out-param write.
+  // -------------------------------------------------------------------
+  pub let dig_query_resolve : (u64, u64, u64, u64) -> u64
+    !{mem} @{} =
+    fn (host_ptr: u64) (host_len: u64) (qtype: u64) (out_addr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "pdxdig.M2-001 (pdxdig#4) DigQuery::dig_query_resolve WEAK STUB. Real body (post libpdx-net dep landing) is `call net_resolve; ret` with the identical 4-arg ABI documented in this file's header (rdi=host_ptr, rsi=host_len, rdx=qtype, rcx=out_addr). Until libpdx-net lands in manifest.pdxproj deps: and R100-PREP-002/§12.1 unblocks a real UDP round-trip, this leaf ignores host_ptr/host_len/qtype entirely (fixed behaviour -- no resolver exists to query), and: (1) if out_addr != 0, writes the 4-byte LE sentinel 0xDEADBEEF (bytes 0xEF,0xBE,0xAD,0xDE at out_addr[0..3]) via four `mov rax, imm; mov_b [rcx+N], rax` stores -- guarded by `cmp rcx, 0; je dq_resolve_no_out` so a null out-param cannot fault this leaf; (2) always returns the full 64-bit sentinel 0x00000000DEADBEEF in rax via `mov rax, 0x00000000DEADBEEF` (explicit 16-hex-digit movabs form, matching src/main.pdx's own magic-constant convention, so no ambiguity between a sign-extended imm32 encoding and a genuine 64-bit zero-extended load). The sentinel is deliberately NOT status-code-shaped (0 / small negative errno) so a caller can tell 'stub answered' from 'real net_resolve answered' without a separate flag, and 0xDEADBEEF is never a routable unicast IPv4 answer so it reads unambiguously as a placeholder in any downstream trace. NOT YET CALLED from Main::_start at this landing (pdxdig#4 scope is 'scaffold the wire' -- see file header 'Call site status'). Pure leaf: no callee-save touch, no push/pop, no stack use. Encoder discipline (per user memory `pdx encoder pitfalls`): no `test` (cmp rcx, 0 for the null-guard); no 2-op `imul` (unused); no `and` on r8..r15 (unused); no `neg` (unused); exactly 4 curried args (at the documented ceiling, not over it); module basename DigQuery matches file stem dig_query.pdx; labels prefixed dq_.",
+      block: {
+        cmp rcx, 0;
+        je dq_resolve_no_out;
+
+        mov rax, 239;                             // 0xEF (byte 0, LE)
+        mov_b [rcx + 0], rax;
+        mov rax, 190;                             // 0xBE (byte 1)
+        mov_b [rcx + 1], rax;
+        mov rax, 173;                             // 0xAD (byte 2)
+        mov_b [rcx + 2], rax;
+        mov rax, 222;                             // 0xDE (byte 3)
+        mov_b [rcx + 3], rax;
+
+      dq_resolve_no_out:
+        mov rax, 0x00000000DEADBEEF;
+        ret;
+      }
+    }
+
+}

@@ -1,29 +1,36 @@
-// src/main.pdx -- pdxdig v1.2.0 (Wave W drain).
+// src/main.pdx -- pdxdig v1.3.0 (Wave GG drain).
 //
 // pdxdig: DNS query CLI (`dig`-equivalent). Ring-3 ELF entry point
 // (`_start`), argv-wired per the frozen execve ABI:
 //   rdi = argc, rsi = argv (VA of a char*[]), rdx = envp (unused),
 //   rsp % 16 == 0 at entry.
 //
-// Wave W "argv-surface + DRY_RUN/UNSUPPORTED_QTYPE branches"
+// Wave GG "--server= override + AuditWire fingerprint"
 // -------------------------------------------------------------
-// Retires the v1.1.0 "argc == 2 gate" argv classifier with a full
-// argv walk that peels `--dry-run`, `--type=`, `--server=`, and
-// `--timeout-ms=` prefix flags (§6.1 grammar), then dispatches the
-// terminal path per the flags. Closes pdxdig#2 (M1-002 argv
-// surface), pdxdig#3 (M1-003 first runnable --dry-run), and
-// pdxdig#6 (M2-003 UNSUPPORTED_QTYPE handling). The real UDP query
-// path (pdxdig#4 / M2-001) remains BLOCKED on §12.1 (SOCK_DGRAM
-// extension); the no-flag path still exits 3 with `pdxdig: udp
-// stub\n` on fd 2 per v1.1.0.
+// Extends the v1.2.0 argv-surface parser: `--server=` now REALLY
+// parses a dotted-quad IPv4 value via `ArgvParse::argv_parse_ipv4`
+// (pdxdig#5, M2-002) and stores it in the module-level
+// `dig_server_override_ip` (packed 4-byte, MSB-first) instead of
+// no-op'ing; a malformed `--server=` value is a usage refusal (same
+// bucket as an unknown `-flag`). Once per argv-accepted invocation,
+// `_start` also calls `AuditWire::pdxdig_audit_log_query` (pdxdig#7,
+// M3-001) immediately after the `sys_semantic_send` emission -- a
+// STUB today (libpdx-audit is not yet in this repo's `deps:`), real
+// once that dep lands. `src/dig_query.pdx` (pdxdig#4, M2-001)
+// scaffolds the real UDP query wire's extern contract but is NOT
+// YET called from `_start` -- see that file's header. `--timeout-ms=`
+// remains recognized-but-no-op (a future M2-004 landing).
 //
-// v1.2.0 argv grammar (subset of §6.1) --------------------------------
+// v1.3.0 argv grammar (subset of §6.1) --------------------------------
 //   pdxdig <name>                          -- STUB (unchanged from v1.1.0)
 //   pdxdig --dry-run <name>                -- REAL DRY_RUN path, exit 0
 //   pdxdig --type=A <name>                 -- treated as bare "<name>"
 //   pdxdig --type=<other> <name>           -- UNSUPPORTED_QTYPE, exit 4
-//   pdxdig --server=1.2.3.4 <name>         -- recognized, no-op at v1.2
-//   pdxdig --timeout-ms=500 <name>         -- recognized, no-op at v1.2
+//   pdxdig --server=1.2.3.4 <name>         -- REAL: parses + stores the
+//                                              override (pdxdig#5); a
+//                                              malformed value is a
+//                                              usage refusal (exit 2)
+//   pdxdig --timeout-ms=500 <name>         -- recognized, no-op at v1.3
 //   pdxdig                                 -- usage on fd 2, exit 2
 //   pdxdig -<unknown>                      -- usage on fd 2, exit 2
 //   pdxdig -*                              -- last positional wins
@@ -33,7 +40,8 @@
 //
 // Exit statuses ------------------------------------------------------
 //   0 = --dry-run path taken; record emitted with result_code=DRY_RUN
-//   2 = argv usage refusal (no positional OR unknown -flag)
+//   2 = argv usage refusal (no positional, unknown -flag, OR a
+//       malformed --server= value)
 //   3 = no-flag path (v1.1.0 STUB fallback: UDP path not yet wired)
 //   4 = --type=<non-A> UNSUPPORTED_QTYPE path
 //
@@ -137,6 +145,22 @@ module Main = structure {
   pub let pdxdig_dqr_tail_unsupp         : u64 = 0x0000040000000000
 
   // -------------------------------------------------------------------
+  // --server= override state (pdxdig#5, M2-002). `dig_server_override_ip`
+  // holds the packed MSB-first IPv4 (ArgvParse::argv_parse_ipv4's
+  // success shape) parsed from the LAST `--server=` occurrence seen
+  // during the argv walk; `dig_server_override_set` distinguishes
+  // "0.0.0.0 explicitly passed" (a legal, if unusual, override) from
+  // "no --server= seen" (both leave dig_server_override_ip == 0).
+  // Neither variable is consumed by any real resolver-selection code
+  // yet -- there IS no real resolver path at v1.3 (see
+  // src/dig_query.pdx, pdxdig#4, BLOCKED on §12.1) -- so this is
+  // scaffold state a future M2-001 landing reads instead of the
+  // boot-seeded resolver config.
+  // -------------------------------------------------------------------
+  pub let mut dig_server_override_ip  : u64 = 0
+  pub let mut dig_server_override_set : u64 = 0
+
+  // -------------------------------------------------------------------
   // _start -- pdxdig entry point. Never returns; every terminal path
   // ends in sys_exit.
   //
@@ -149,7 +173,12 @@ module Main = structure {
   //   rbx = flags bit-set:
   //           bit 0 = --dry-run seen
   //           bit 1 = --type=<non-A> seen (UNSUPPORTED_QTYPE)
-  //           bit 2 = unknown -flag seen (-> usage refusal)
+  //           bit 2 = unknown -flag seen OR malformed --server= value
+  //                   (-> usage refusal; pdxdig#5 folds a malformed
+  //                   --server= into the same usage-refusal bucket)
+  //           bit 3 = --server= override accepted (doc-only at v1.3;
+  //                   the real value lives in dig_server_override_ip
+  //                   / dig_server_override_set, not in this bit)
   //   rbp = argv loop index i
   //
   // Effects: {mem, sysreg}  Caps: @{fs, sched, cap}
@@ -163,7 +192,7 @@ module Main = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched, cap},
-      justification: "pdxdig v1.2.0 (Wave W drain) argv-surface _start. Extends the v1.1.0 argc==2 gate to a full argv walk that peels --dry-run (exact match) + --type=/--server=/--timeout-ms= (prefix match) via ArgvParse::argv_parse_eq_len / argv_parse_prefix, then dispatches per-flag. Register plan: r12=argc, r13=argv, r14=qname_ptr (last positional wins, 0=not-yet-seen), r15=qname_hash accumulator, rbx=flag bit-set (bit0=dry_run, bit1=unsupp_qtype, bit2=unknown_flag), rbp=argv loop index i. All callee-save (rbx/rbp/r12..r15) survive every SysV `call` to ArgvParse helpers; no push/pop, rsp%16==0 at entry preserved throughout (helpers are pure leaves that never nest a call, so rsp%16==8 inside them is fine). Argv loop: for each i in 1..argc: read arg_ptr = [r13 + rbp*8]; if byte 0 != '-' (0x2D) it's a positional -> r14 = arg_ptr; else try --dry-run (eq_len 9) -> or rbx, 1; try --type= (prefix 7) -> read arg[7]/arg[8] and require 'A' (0x41) + NUL else or rbx, 2; try --server= (prefix 9) -> no-op; try --timeout-ms= (prefix 13) -> no-op; else or rbx, 4 (unknown flag). After loop: if rbx bit 2 set OR r14 == 0 -> usage exit 2. Compute rolling-add qname hash (matches v1.1.0 placeholder). Marshal 48-byte DnsQueryRecord@0.1 with qtype=1 (A always) and tail chosen per rbx bit 1: unsupp_qtype -> pdxdig_dqr_tail_unsupp (result_code=4); else -> pdxdig_dqr_tail_dry_run (result_code=5, covers both --dry-run path and STUB fallback). Emit via sys_semantic_send (SC+ 115). Terminal dispatch: rbx bit 1 -> `pdxdig: unsupported qtype\\n` fd2 + exit 4; else rbx bit 0 -> `pdxdig: dry-run ok\\n` fd2 + exit 0; else -> `pdxdig: udp stub\\n` fd2 + exit 3 (unchanged v1.1.0 STUB tail). sys_semantic_send return intentionally not inspected (marshalling failure surface, not a per-run condition). Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (unused); no `and rN, imm64` on r8..r15 (rbx is legacy, safe for `and rbx, imm8`; every other mask fits imm32 on rax); no `neg` mnemonic (unused); byte loads via `xor rax, rax; mov_b rax, [ptr]` per paideia-as #1248 REX.W upper-bits contract; module basename Main; every label prefixed pdxdig_; rip-relative loads/stores proven at sys_semantic_send.pdx lines 214/221; movabs for the 8-byte schema constant same file line 221. Cross-module `call ArgvParse::argv_parse_*` uses the same unqualified-symbol convention as tools/user/mount.pdxfs/src/argv.pdx line 244+ (call site into flag_spec_register, external symbol resolution by function-name at link time).",
+      justification: "pdxdig v1.3.0 (Wave GG drain) argv-surface _start. Extends the v1.2.0 argv walk: --server= (pdxdig#5, M2-002) now calls ArgvParse::argv_parse_ipv4 on arg_ptr+9 and either stores the packed result into [rip + dig_server_override_ip] + sets [rip + dig_server_override_set] = 1 + or rbx, 8 (doc-only bit), or -- on the all-ones failure sentinel -- or rbx, 4 (folds a malformed --server= value into the same usage-refusal bucket as an unknown -flag). Immediately after the sys_semantic_send emission, calls AuditWire::pdxdig_audit_log_query(r14 qname_ptr, 1 qtype, result_code) once per accepted invocation (pdxdig#7, M3-001) -- result_code is recomputed from rbx bit 1 rather than reused from any register `syscall` may have disturbed. Register plan: r12=argc, r13=argv, r14=qname_ptr (last positional wins, 0=not-yet-seen), r15=qname_hash accumulator, rbx=flag bit-set (bit0=dry_run, bit1=unsupp_qtype, bit2=unknown_flag-or-malformed-server, bit3=server_override accepted, doc-only), rbp=argv loop index i. All callee-save (rbx/rbp/r12..r15) survive every SysV `call` to ArgvParse/AuditWire helpers; no push/pop, rsp%16==0 at entry preserved throughout (every callee is a pure leaf that never nests a call, so rsp%16==8 inside them is fine). Argv loop: for each i in 1..argc: read arg_ptr = [r13 + rbp*8]; if byte 0 != '-' (0x2D) it's a positional -> r14 = arg_ptr; else try --dry-run (eq_len 9) -> or rbx, 1; try --type= (prefix 7) -> read arg[7]/arg[8] and require 'A' (0x41) + NUL else or rbx, 2; try --server= (prefix 9) -> argv_parse_ipv4 on arg_ptr+9, store-or-reject per above; try --timeout-ms= (prefix 13) -> no-op; else or rbx, 4 (unknown flag). After loop: if rbx bit 2 set OR r14 == 0 -> usage exit 2. Compute rolling-add qname hash (matches v1.1.0 placeholder). Marshal 48-byte DnsQueryRecord@0.1 with qtype=1 (A always) and tail chosen per rbx bit 1: unsupp_qtype -> pdxdig_dqr_tail_unsupp (result_code=4); else -> pdxdig_dqr_tail_dry_run (result_code=5, covers both --dry-run path and STUB fallback). Emit via sys_semantic_send (SC+ 115), then the AuditWire call described above. Terminal dispatch: rbx bit 1 -> `pdxdig: unsupported qtype\\n` fd2 + exit 4; else rbx bit 0 -> `pdxdig: dry-run ok\\n` fd2 + exit 0; else -> `pdxdig: udp stub\\n` fd2 + exit 3 (unchanged v1.1.0 STUB tail). sys_semantic_send / pdxdig_audit_log_query returns intentionally not inspected (marshalling failure surface / STUB-always-AFS_OK, not a per-run condition). Encoder discipline (per user memory `pdx encoder pitfalls`): no `test rN, rN` (every zero-check is `cmp rN, 0`); no 2-op `imul r, imm` (unused); no `and rN, imm64` on r8..r15 (rbx is legacy, safe for `and rbx, imm8`; every other mask fits imm32 on rax); no `neg` mnemonic (unused); byte loads via `xor rax, rax; mov_b rax, [ptr]` per paideia-as #1248 REX.W upper-bits contract; the two all-ones sentinel compares against argv_parse_ipv4's failure return load the 64-bit constant into r11 first (`mov r11, 0xFFFFFFFFFFFFFFFF; cmp rax, r11`) rather than encoding it as a cmp immediate; module basename Main; every label prefixed pdxdig_; rip-relative loads/stores proven at sys_semantic_send.pdx lines 214/221 and pdxsock main.pdx L1294 (direct `mov [rip + sym], reg` store, used here for dig_server_override_ip/_set); movabs for the 8-byte schema constant same file line 221. Cross-module `call ArgvParse::argv_parse_*` / `call AuditWire::pdxdig_audit_log_query` uses the same unqualified-symbol convention as tools/user/mount.pdxfs/src/argv.pdx line 244+ (call site into flag_spec_register, external symbol resolution by function-name at link time).",
       block: {
         // ---- Step 0: latch argc / argv from execve-ABI registers. ----
         mov r12, rdi;                            // r12 = argc
@@ -229,7 +258,27 @@ module Main = structure {
         call argv_parse_prefix;
         cmp rax, 0;
         je pdxdig_arg_check_timeout;
-        jmp pdxdig_argv_next;                    // recognized, no-op
+
+        // Matched --server=. Parse the dotted-quad at arg_ptr + 9
+        // (pdxdig#5, M2-002). Last --server= occurrence wins, same
+        // as the positional convention.
+        mov r9, [r13 + rbp*8];
+        add r9, 9;
+        mov rdi, r9;
+        call argv_parse_ipv4;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je pdxdig_arg_server_bad;
+
+        mov [rip + dig_server_override_ip], rax;
+        mov r11, 1;
+        mov [rip + dig_server_override_set], r11;
+        or rbx, 8;                               // server_override bit (doc-only)
+        jmp pdxdig_argv_next;
+
+      pdxdig_arg_server_bad:
+        or rbx, 4;                               // malformed value -> usage refusal
+        jmp pdxdig_argv_next;
 
       pdxdig_arg_check_timeout:
         // ---- Try --timeout-ms= (prefix, 13 bytes). -------------------
@@ -318,6 +367,27 @@ module Main = structure {
         mov rax, 115;
         syscall;
         // Return value intentionally not inspected.
+
+        // ---- Step 5b: AuditWire fingerprint (pdxdig#7, M3-001). ------
+        // Once per accepted query: qname_ptr (r14, still live), qtype
+        // (1 = A, always at this landing), result_code (recomputed
+        // from rbx bit 1 rather than reusing a caller-save register
+        // that `syscall` may have disturbed -- matches the tail-
+        // selection logic above exactly).
+        mov rdi, r14;
+        mov rsi, 1;
+        mov rax, rbx;
+        and rax, 2;
+        cmp rax, 0;
+        jne pdxdig_audit_rcode_unsupp;
+        mov rdx, 5;                              // DRY_RUN / STUB result_code
+        jmp pdxdig_audit_call;
+      pdxdig_audit_rcode_unsupp:
+        mov rdx, 4;                              // UNSUPPORTED_QTYPE
+      pdxdig_audit_call:
+        call pdxdig_audit_log_query;
+        // Return value intentionally not inspected -- AuditWire STUB
+        // always returns AFS_OK (0); see src/audit_wire.pdx header.
 
         // ---- Step 6: terminal dispatch. ------------------------------
         // UNSUPPORTED_QTYPE takes precedence over --dry-run (a rejected

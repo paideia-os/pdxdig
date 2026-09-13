@@ -3,15 +3,30 @@
 # Format: one-per-line `<dep> <constraint>` (paideia-os satellite-tool
 # convention; mirrors pdxsock/deps.list shape).
 #
-# pdxdig at v1.1 has no library-external dependencies beyond the SC+
+# pdxdig at v1.3 has no library-external dependencies beyond the SC+
 # syscall floor (sysnos 0/1/60 read/write/exit + 115 sys_semantic_send).
 # The UDP query path (sendto/recvfrom, sysnos 96/97) is blocked on
 # §12.1 and lands at M2-001; libpdx-net will be pulled in as a
-# `deps:` entry at that milestone. libpdx-argv is not consumed at
-# v1.1 (argv parse is inline in src/main.pdx); PDX_TOOL_NAME +
-# PDX_TOOL_VERSION externs are provided pre-emptively in
-# src/tool_ident.pdx per the libpdx-argv 1.1.3 ENH-032 contract so
-# the eventual bump is a one-line manifest edit.
+# `deps:` entry at that milestone. src/dig_query.pdx (pdxdig#4)
+# documents the real `net_resolve` extern contract this dep will
+# satisfy but calls nothing outside this repo yet (see that file's
+# header on why -- this repo's tools/build.sh links every src/*.o
+# into one flat ELF with --fatal-warnings; an unresolved UND symbol
+# would break every build, not just the M2-001 call site).
+#
+# libpdx-audit (pdxdig#7, M3-001) is similarly not yet a real `deps:`
+# entry -- src/audit_wire.pdx's `AuditWire::pdxdig_audit_log_query`
+# is a WEAK STUB (always returns AFS_OK = 0) called once per accepted
+# query from Main::_start; the real body will call
+# `AuditFileSink::audit_file_append("/system/audit/pdxdig.log", ...)`
+# once this dep lands.
+#
+# libpdx-argv is not consumed at v1.3 (argv parse is inline in
+# src/main.pdx / src/argv_parse.pdx); PDX_TOOL_NAME + PDX_TOOL_VERSION
+# externs are provided pre-emptively in src/tool_ident.pdx per the
+# libpdx-argv 1.1.3 ENH-032 contract so the eventual bump is a
+# one-line manifest edit.
 
 # libpdx-net    >= 0.1.0   # deferred to pdxdig.M2-001 (real UDP query)
+# libpdx-audit  >= 0.1.0   # deferred to pdxdig.M3-001-b (real audit_file_append)
 # libpdx-argv   >= 1.1.3   # deferred; PDX_TOOL_NAME contract pre-satisfied

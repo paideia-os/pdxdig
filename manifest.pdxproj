@@ -1,49 +1,64 @@
 # pdxdig -- paideia-as build manifest
 #
-# Wave: R100  Milestone: Wave W drain (pdxdig#1, #2, #3, #6, #8)
+# Wave: R100  Milestone: Wave GG drain (pdxdig#4, #5, #7, #9, #18)
 # Doc:  design/networking/r100-user-tools-plan.md §6 + §13.5
 #       (paideia-os repo).
 #
-# v1.2.0 (this landing, Wave W drain) extends the Wave L v1.1.0
-# scaffold with a full argv-surface parser and multi-branch result
-# dispatch:
-#   * pdxdig#1  (M1-001, honest witness) -- scaffold + KIND_USER
-#     caps.decl already complete in v1.1.0; recorded formally here.
-#   * pdxdig#2  (M1-002, real body) -- --dry-run / --type= /
-#     --server= / --timeout-ms= argv-surface parser via inline
-#     ArgvParse helpers.
-#   * pdxdig#3  (M1-003, real body) -- --dry-run first-runnable
-#     path: emits DnsQueryRecord@0.1 with result_code=DRY_RUN via
-#     sys_semantic_send + exits 0 with `pdxdig: dry-run ok\n` fd 2
-#     fingerprint band.
-#   * pdxdig#6  (M2-003, real body) -- --type=<non-A> emits
-#     result_code=UNSUPPORTED_QTYPE (4) + exits 4 with `pdxdig:
-#     unsupported qtype\n` fd 2 fingerprint band. Distinct exit
-#     from a real DNS failure (exit 3/1/etc).
-#   * pdxdig#8  (M3-002, honest witness) -- DnsQueryRecord@0.1
-#     schema bind + emit already landed at Wave L v1.1.0 (pdxdig#17);
-#     the txn_id slot is reserved at record[+43..+44] and stays 0
-#     at v1.2 (randomization gated on M2-001 UDP substrate).
+# v1.3.0 (this landing, Wave GG drain) extends the Wave W v1.2.0
+# argv-surface parser with a real --server= override, a documented
+# (not-yet-linkable) UDP-query extern scaffold, a libpdx-audit STUB
+# wire, a happy-path A-record smoke witness, and the release closer:
+#   * pdxdig#4  (M2-001, scaffold) -- documents the real
+#     `net_resolve(host_ptr, host_len, qtype, out_addr) -> u64`
+#     extern contract in src/dig_query.pdx and provides a WEAK-STUB
+#     `dig_query_resolve` returning the 0xDEADBEEF sentinel. BLOCKED
+#     on R100-PREP-002 / §12.1 (kernel-side SOCK_DGRAM extension);
+#     NOT YET called from Main::_start (see that file's header).
+#   * pdxdig#5  (M2-002, real body) -- `--server=IP.IP.IP.IP` now
+#     really parses via the new `ArgvParse::argv_parse_ipv4` leaf and
+#     stores the packed result in `Main::dig_server_override_ip` /
+#     `dig_server_override_set`; a malformed value is a usage
+#     refusal (exit 2, same bucket as an unknown -flag).
+#   * pdxdig#7  (M3-001, STUB wire) -- src/audit_wire.pdx's
+#     `AuditWire::pdxdig_audit_log_query` is called once per
+#     argv-accepted invocation (immediately after the
+#     sys_semantic_send emission); STUB body returns AFS_OK (0)
+#     since libpdx-audit is not yet in `deps:` -- real body will call
+#     `AuditFileSink::audit_file_append("/system/audit/pdxdig.log",
+#     ...)` with a compact query-name/qtype/rcode fingerprint line.
+#   * pdxdig#9  (M4-001, happy-path witness) -- tests/dig_a_smoke.pdx
+#     mocks a resolver reply for example.com (A -> 93.184.216.34) via
+#     a test-local WEAK stub shaped like the real net_resolve extern
+#     and asserts the extracted answer bytes + fd-2 fingerprint line
+#     both carry the literal address.
+#   * pdxdig#18 (v1.1-C release closer, this landing = v1.3.0 since
+#     v1.1.0/v1.2.0 already tagged) -- CHANGELOG + README +
+#     release/manifest.pdxsig.txt + release/RELEASE-1.3.0.md +
+#     `git tag v1.3.0`.
 #
-# The real UDP query path (M2-001) is BLOCKED on §12.1 (SOCK_DGRAM
-# extension). At v1.2.0 the tool body:
+# The real UDP query path (M2-001) remains BLOCKED on §12.1
+# (SOCK_DGRAM extension). At v1.3.0 the tool body:
 #   * walks argv[1..argc]:
-#       -- peels --dry-run / --type= / --server= / --timeout-ms=
-#          via ArgvParse::argv_parse_eq_len / argv_parse_prefix;
+#       -- peels --dry-run / --type= / --server= / --timeout-ms= via
+#          ArgvParse::argv_parse_eq_len / argv_parse_prefix;
+#       -- REAL --server= parse via ArgvParse::argv_parse_ipv4
+#          (pdxdig#5) -- malformed value folds into usage refusal;
 #       -- records the last positional as qname (dig(1) tail convention);
-#   * marshals a DnsQueryRecord@0.1 (qtype=1 always at v1.2);
+#   * marshals a DnsQueryRecord@0.1 (qtype=1 always at v1.3);
 #   * emits via sys_semantic_send (SC+ 115);
+#   * calls AuditWire::pdxdig_audit_log_query once per accepted query
+#     (pdxdig#7, STUB body);
 #   * dispatches terminal exit per flag set:
 #       --type=<non-A>  -> UNSUPPORTED_QTYPE record + exit 4
 #       --dry-run       -> DRY_RUN record + exit 0
 #       (no flag)       -> DRY_RUN record + `pdxdig: udp stub\n` + exit 3
 # All shared infrastructure (response walker, RCODE parser, CNAME
-# follow with loop-guard) is real code; the tests exercise it
-# against .rodata fixtures rather than live sockets, matching the
-# fixture-harness pattern pdxsock adopted at M4-001..M4-003.
+# follow with loop-guard, argv IPv4 parser) is real code; the tests
+# exercise it against .rodata/.bss fixtures rather than live sockets,
+# matching the fixture-harness pattern pdxsock adopted at M4-001..M4-003.
 
 name        = pdxdig
-version     = 1.2.0
+version     = 1.3.0
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxdig.elf
@@ -52,14 +67,23 @@ caps_decl   = caps.decl
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). --------------
 sources:
-  - src/main.pdx                        # _start + argv parse + semantic-pipe emit
-  - src/argv_parse.pdx                  # ArgvParse prefix + eq_len helpers (Wave W)
+  - src/main.pdx                        # _start + argv parse + semantic-pipe emit + AuditWire call
+  - src/argv_parse.pdx                  # ArgvParse prefix/eq_len/ipv4 helpers (Wave W + GG)
   - src/dns_walker.pdx                  # RCODE parse + CNAME follow (loop-guard 4)
+  - src/dig_query.pdx                   # DigQuery: M2-001 net_resolve extern scaffold + WEAK stub (pdxdig#4)
+  - src/audit_wire.pdx                  # AuditWire: libpdx-audit STUB wire (pdxdig#7)
   - src/tool_ident.pdx                  # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
 
 # --- Library dependencies --------------------------------------------
-# libpdx-net wire-in is deferred to M2-001 (real UDP query); at v1.1.0
-# the tool self-contains the schema constant + record marshalling.
+# libpdx-net wire-in is deferred to M2-001 (real UDP query, BLOCKED on
+# §12.1); libpdx-audit wire-in is deferred to a M3-001-b follow-up
+# once this repo's caps.decl/manifest can carry the real dep without
+# breaking the flat single-ELF link `tools/build.sh` performs (every
+# src/*.o links together with `--fatal-warnings` -- an unresolved UND
+# symbol from either library would break every build, not just the
+# one call site, until the dep actually lands). At v1.3.0 both
+# extern-shaped call sites (dig_query_resolve, pdxdig_audit_log_query)
+# are self-contained WEAK stubs -- see their own file headers.
 deps: []
 
 # --- Test targets ----------------------------------------------------
@@ -72,6 +96,7 @@ tests:
   - tests/m4_003_timeout.pdx            # pdxdig#11 -- timeout classifier
   - tests/m4_004_malformed_matrix.pdx   # pdxdig#12 -- 5+ malformed fixtures
   - tests/m4_005_cname_smoke.pdx        # pdxdig#13 -- CNAME follow + loop-guard
+  - tests/dig_a_smoke.pdx               # pdxdig#9  -- happy-path A-record vs. mocked reply
 
 # --- Documentation targets -------------------------------------------
 # .pdxdoc source for `doc pdxdig` lands at M5-001 (deferred).
