@@ -16,9 +16,43 @@ Version discipline:
              net_resolve extern scaffold (WEAK stub), M3-001
              libpdx-audit STUB wire, M4-001 happy-path A-record
              smoke, release closer (pdxdig#4, #5, #7, #9, #18).
+  v1.4.0 -- Wave GGG drain: docs/release-only bump -- dual-signed
+             manifest.pdxsig + .pdxdoc (M5-001) + mirror-push runbook
+             (M5-002). No src/ or tests/ file changes (pdxdig#14, #15).
 -->
 
 ## [Unreleased]
+
+## [1.4.0] -- 2026-09-13 -- Wave GGG drain (Closes #14. Closes #15.)
+
+Docs/release-only bump on top of v1.3.0 -- no source or test file
+under `src/` or `tests/` changes in this landing.
+
+### Added
+- **`doc/pdxdig.pdxdoc` (pdxdig#14, M5-001).** `pdxdoc-source v0.1`
+  documentation source (NAME / SYNOPSIS / DESCRIPTION / OPTIONS /
+  EXIT-CODES / RECORD / AUDIT / LIMITATIONS / SEE-ALSO), wired into
+  `manifest.pdxproj`'s previously-empty `docs:` list.
+- **`release/manifest.pdxsig.txt`** bumped to package-version 1.4.0 /
+  `source-tag: v1.4.0`; artifact list extends to cover the new
+  `doc/pdxdig.pdxdoc` entry. Both `[signatures]` blocks remain the
+  documented `SIGNATURE_PLACEHOLDER_PENDING_LIVE_SIGN` sentinel --
+  live release-line key material still lives outside every repo per
+  `design/02-development-environment.md` §1164.
+- **`release/RELEASE-1.4.0.md`** (new) -- release note + cut-a-release
+  runbook, following the v1.3.0 template.
+- **`release/mirror-push.md` (pdxdig#15, M5-002).** Documents the
+  `pkgs.paideia-os` mirror URL pattern, the push workflow, and the
+  verification steps a future operator runs once the R32
+  signed-release infra lands. No push happens as part of this
+  milestone -- the `pkgs.paideia-os` endpoint does not exist yet.
+
+### Unchanged
+- Every file under `src/` and `tests/` is byte-for-byte the v1.3.0
+  body. `PDX_TOOL_VERSION` in `src/tool_ident.pdx` stays `"1.3.0\0"`
+  in this landing (a source edit is out of scope for a docs-only
+  release closer); the next source-bearing wave reconciles it with
+  the `v1.4.0` tag.
 
 ## [1.3.0] -- 2026-09-13 -- Wave GG drain
 

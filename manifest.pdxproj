@@ -36,6 +36,20 @@
 #     release/manifest.pdxsig.txt + release/RELEASE-1.3.0.md +
 #     `git tag v1.3.0`.
 #
+# v1.4.0 (Wave GGG drain) is a docs/release-only bump on top of v1.3.0
+# -- no source file under src/ or tests/ changes:
+#   * pdxdig#14 (M5-001, dual-signed manifest.pdxsig + CHANGELOG +
+#     .pdxdoc) -- doc/pdxdig.pdxdoc lands (new); release/manifest.pdxsig.txt
+#     bumped to package-version 1.4.0 / source-tag v1.4.0; CHANGELOG.md
+#     gains the [1.4.0] stanza closing this milestone. Both dual-sign
+#     placeholder blocks remain PENDING/SIGNATURE_PLACEHOLDER_* --
+#     live key material is still out-of-repo per
+#     design/02-development-environment.md §1164.
+#   * pdxdig#15 (M5-002, mirror push) -- release/mirror-push.md (new)
+#     documents the pkgs.paideia-os push target, workflow, and
+#     verification steps; still BLOCKED on the R32 signed-release
+#     infra landing (no pkgs.paideia-os endpoint exists yet).
+#
 # The real UDP query path (M2-001) remains BLOCKED on §12.1
 # (SOCK_DGRAM extension). At v1.3.0 the tool body:
 #   * walks argv[1..argc]:
@@ -58,7 +72,7 @@
 # matching the fixture-harness pattern pdxsock adopted at M4-001..M4-003.
 
 name        = pdxdig
-version     = 1.3.0
+version     = 1.4.0
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxdig.elf
@@ -99,8 +113,9 @@ tests:
   - tests/dig_a_smoke.pdx               # pdxdig#9  -- happy-path A-record vs. mocked reply
 
 # --- Documentation targets -------------------------------------------
-# .pdxdoc source for `doc pdxdig` lands at M5-001 (deferred).
-docs: []
+# .pdxdoc source for `doc pdxdig`, landed at M5-001 (pdxdig#14, Wave GGG).
+docs:
+  - doc/pdxdig.pdxdoc
 
 # --- Paideia-as compliance flags -------------------------------------
 compliance:

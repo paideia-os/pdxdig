@@ -1,0 +1,151 @@
+%%% pdxdoc-source v0.1
+%%% This is the source form of the .pdxdoc file that `doc pdxdig`
+%%% renders. Format hardening lands with doc.M1-002 (paideia-os plan
+%%% §5.3); the M5-001 source lives in the repo under version control
+%%% and the release tool ships the compiled `.pdxdoc` alongside the
+%%% binary into /pkgs/pdxdig-1.4.0/doc/pdxdig.pdxdoc.
+%%%
+%%% Section markers: a bare `==== <title>` line opens a section. Cross-
+%%% references use `[[cref: <target>]]` where <target> is either a
+%%% doc-local section title or a `<tool>#<section>` fully-qualified
+%%% reference the reader resolves against /system/doc/. POSIX-difference
+%%% annotations use a `[[posix: <difference>]]` inline tag.
+
+==== NAME
+pdxdig -- DNS query CLI (`dig`-equivalent) for paideia-os.
+
+==== SYNOPSIS
+    pdxdig <name>
+    pdxdig --dry-run <name>
+    pdxdig --type=A <name>
+    pdxdig --type=<other> <name>
+    pdxdig --server=IP.IP.IP.IP <name>
+    pdxdig --timeout-ms=<n> <name>
+
+Flag/positional order is unconstrained; the last positional argv slot
+wins (matches `dig(1)`'s own tail-argument convention). Long flags may
+appear in any position and in any combination.
+
+==== DESCRIPTION
+`pdxdig` is a standalone ring-3 ELF -- its own `_start`, no shared
+library, no dynamic linker -- that issues an `A`-record DNS query and
+reports the result. It is one of seven R100 user-space networking
+tools; see `design/networking/r100-user-tools-plan.md` §6 + §13.5 in
+the paideia-os monorepo for the wave charter this tool's issues are
+filed against. Its wave siblings are [[cref: pdxsock#NAME]],
+[[cref: pdxping#NAME]] and [[cref: pdxtrust#NAME]].
+
+[[posix: there is no `/etc/resolv.conf` and no stub resolver library
+underneath this tool. `--server=` is the only way to name a resolver;
+absent it, the tool has no notion of "the system nameserver" -- resolver
+selection is argv-level, not a hidden environment lookup.]]
+
+At v1.4.0 the real UDP query round-trip is BLOCKED on the kernel-side
+`SOCK_DGRAM` extension (R100-PREP-002, design doc §12.1): every
+invocation marshals and emits a `DnsQueryRecord@0.1` on the semantic
+pipe, then a `libpdx-audit` fingerprint (STUB body today), and the
+no-flag path exits 3 with `pdxdig: udp stub` on fd 2 rather than
+performing a live query. See [[cref: LIMITATIONS]].
+
+==== OPTIONS
+
+---- --dry-run
+Skip the (currently stubbed) query round-trip and take the REAL
+`DRY_RUN` exit path deterministically: emits a `DnsQueryRecord@0.1`
+with `result_code = DRY_RUN` (5), writes
+`pdxdig: dry-run ok` to fd 2, exits 0.
+
+---- --type=<QTYPE>
+Only `A` is supported at v1.4.0 (`libpdx-net`'s resolver parses no
+other RR type). `--type=A` is accepted as equivalent to omitting the
+flag. Any other value is refused cleanly with `UNSUPPORTED_QTYPE`
+(exit 4) rather than attempted and misparsed.
+
+---- --server=IP.IP.IP.IP
+Parses a dotted-quad IPv4 address (0..255 per octet, exactly three
+`.` separators) via `ArgvParse::argv_parse_ipv4` and stores it as the
+resolver override. A malformed value (empty octet, octet > 255, wrong
+octet count, non-digit byte) is folded into the same usage-refusal
+bucket (exit 2) an unknown `-flag` uses -- it is not a distinct error
+class from the caller's point of view. The parsed value is not yet
+consumed by any resolver-selection code (see
+[[cref: LIMITATIONS]]); it is stored for the M2-001 real query path
+to read once that lands.
+
+---- --timeout-ms=<n>
+Recognized and accepted; presently a no-op. No elevate needed for any
+flag here -- UDP DNS queries take no more privilege than the TCP
+sockets other R100 tools already use.
+
+==== EXIT-CODES
+
+---- 0
+`--dry-run` path taken. Record emitted with `result_code = DRY_RUN`.
+
+---- 2
+Argv usage refusal: no positional argument given, an unrecognized
+`-flag` seen, or a malformed `--server=` value. Emits `pdxdig: usage`
+on fd 2.
+
+---- 3
+No-flag path taken at v1.4.0: the real UDP query is not yet wired
+(BLOCKED on R100-PREP-002). Emits `pdxdig: udp stub` on fd 2 after
+still marshalling and emitting the semantic-pipe record.
+
+---- 4
+`--type=<non-A>` refusal (`UNSUPPORTED_QTYPE`). Takes precedence over
+`--dry-run` if both conditions are present in one invocation -- a
+rejected `--type=` is a client-side error regardless of dry-run
+intent.
+
+==== RECORD
+Each invocation emits a 48-byte `DnsQueryRecord@0.1` on the
+semantic-pipe ring via `sys_semantic_send` (SC+ ID 115), schema tag
+`0x446E735172797201`:
+
+    [ +0]  magic         [u8; 8]     "PDXKDIG_" ASCII
+    [ +8]  version:u32 | flags:u32
+    [+16]  audit_id      u64         zero at v1.4.0
+    [+24]  qname_hash    u64         rolling-add placeholder
+    [+32]  qtype:u16 | answer_ip:u32 | ttl_hi:u16   -- qtype=1 (A) always
+    [+40]  ttl_lo:u16 | cname_hops:u8 | txn_id:u16 | result_code:u8 | reserved:u16
+
+`result_code` enum: `OK`=0, `NXDOMAIN`=1, `TIMEOUT`=2,
+`MALFORMED_RESPONSE`=3, `UNSUPPORTED_QTYPE`=4, `DRY_RUN`=5. Only 4 and
+5 are reachable at v1.4.0; 0..3 are wired by the shared response
+walker (`src/dns_walker.pdx`) and exercised today only against the
+tests' mocked fixtures, not a live socket.
+
+==== AUDIT
+Once per argv-accepted invocation, `AuditWire::pdxdig_audit_log_query`
+is called immediately after the `sys_semantic_send` emission. It is a
+STUB at v1.4.0 -- `libpdx-audit` is not yet in this repo's `deps:` --
+and always returns `AFS_OK` (0); the real body will call
+`AuditFileSink::audit_file_append("/system/audit/pdxdig.log", ...)`
+with a compact query-name/qtype/rcode fingerprint line once that
+dependency lands (M3-001-b follow-up).
+
+==== LIMITATIONS
+- The real UDP query round-trip (M2-001) is BLOCKED on
+  R100-PREP-002 (§12.1 kernel-side `SOCK_DGRAM` extension).
+  `src/dig_query.pdx` documents the real `net_resolve` extern
+  contract and ships a WEAK-STUB `dig_query_resolve` returning the
+  `0xDEADBEEF` sentinel; it is not yet called from `_start`.
+- `--server=` is parsed and stored but not yet consumed by any
+  resolver-selection code -- no real resolver path exists yet to read
+  it (M2-001-b follow-up).
+- `--timeout-ms=` is recognized but semantics are a no-op (M2-004
+  follow-up).
+- The `libpdx-audit` fingerprint call is a STUB (see
+  [[cref: AUDIT]]); wiring the real dependency is gated on it landing
+  without breaking this repo's flat single-ELF `--fatal-warnings`
+  link.
+- `manifest.pdxsig`'s dual signature blocks (Ed25519 + ML-DSA-65) are
+  documented placeholders pending live release-line key material --
+  see `release/RELEASE-1.4.0.md` §3.
+
+==== SEE-ALSO
+[[cref: pdxsock#NAME]], [[cref: pdxping#NAME]],
+[[cref: pdxtrust#NAME]] -- R100 wave siblings.
+[[cref: libpdx-net#NAME]] -- future `net_resolve` implementor.
+[[cref: libpdx-audit#NAME]] -- future `audit_file_append` implementor.

@@ -1,16 +1,16 @@
-# pdxdig v1.3.0 -- release manifest (source form)
+# pdxdig v1.4.0 -- release manifest (source form)
 #
 # This is the human-readable source form of `manifest.pdxsig`. The
 # release tool at pkgs.paideia-os mirror-push time (a) enumerates the
 # artifact list below, (b) recomputes every BLAKE3-256 hash from the
-# repo tree at the v1.3.0 tag, (c) writes the completed manifest into
+# repo tree at the v1.4.0 tag, (c) writes the completed manifest into
 # a binary `manifest.pdxsig`, and (d) invokes
 #   paideia-pq-sign::sign_release_artifact(sk, manifest_path)
 # once with the paideia-release-line Ed25519 secret key and once with
 # the ML-DSA-65 secret key. The two detached signatures are appended
 # to the manifest in the fixed layout below and the resulting
 # `manifest.pdxsig` is pushed to
-#   https://pkgs.paideia-os/main/pdxdig/1.3.0/manifest.pdxsig
+#   https://pkgs.paideia-os/main/pdxdig/1.4.0/manifest.pdxsig
 # alongside the compiled artifacts.
 #
 # Format mirrors `pdxsock`'s, `mkfs.pdxfs`'s, and `libpdx-audit`'s own
@@ -18,8 +18,8 @@
 # of the three for the worked template this one follows. Every
 # `<BLAKE3-*>` / `<...-KID-*>` / `<...-SIG-*>` slot below is a
 # placeholder the release tool fills in from the working tree at tag
-# time; NONE are computed by this milestone (pdxdig#18, Wave GG
-# drain -- see `release/RELEASE-1.3.0.md` §3 for why signing is out
+# time; NONE are computed by this milestone (pdxdig#14, Wave GGG
+# drain -- see `release/RELEASE-1.4.0.md` §3 for why signing is out
 # of scope here).
 #
 # Reference:
@@ -30,18 +30,18 @@
 #   design/tooling/plan.md §6.3                               -- package
 #     repository layout, `manifest.pdxsig` per version directory.
 #   design/networking/r100-user-tools-plan.md §6 + §13.5      -- pdxdig
-#     scope + the R100 wave milestone breakdown this closes Wave GG of.
+#     scope + the R100 wave milestone breakdown this closes Wave GGG of.
 
 format-version:      1
 manifest-schema:     paideia-manifest-pdxsig@1
 package-name:        pdxdig
-package-version:     1.3.0
-package-release:     R100-WaveGG
+package-version:     1.4.0
+package-release:     R100-WaveGGG
 package-kind:        cli-tool
 package-license:     MIT
 source-repo:         https://github.com/paideia-os/pdxdig
-source-commit:       <TAG-v1.3.0-COMMIT-SHA>   # release tool fills in
-source-tag:          v1.3.0
+source-commit:       <TAG-v1.4.0-COMMIT-SHA>   # release tool fills in
+source-tag:          v1.4.0
 
 # ---------------------------------------------------------------
 # Artifact set -- every file the compiled package ships. The hash
@@ -62,10 +62,7 @@ src/main.pdx                       blake3-256 = <BLAKE3-main.pdx>
 src/tool_ident.pdx                 blake3-256 = <BLAKE3-tool_ident.pdx>
 
 [artifacts.doc]
-# No .pdxdoc source exists at v1.3.0 -- `doc pdxdig` source lands at
-# a future M5-001 (deferred; see manifest.pdxproj `docs: []`). This
-# block is intentionally empty; the release tool must not synthesise
-# a `<BLAKE3-*>` slot for a non-existent file.
+doc/pdxdig.pdxdoc                  blake3-256 = <BLAKE3-pdxdig.pdxdoc>
 
 [artifacts.tests]
 tests/dig_a_smoke.pdx              blake3-256 = <BLAKE3-dig_a_smoke.pdx>
@@ -82,6 +79,8 @@ tools/build.sh                     blake3-256 = <BLAKE3-tools-build.sh>
 
 [artifacts.release]
 release/RELEASE-1.3.0.md           blake3-256 = <BLAKE3-RELEASE-1.3.0.md>
+release/RELEASE-1.4.0.md           blake3-256 = <BLAKE3-RELEASE-1.4.0.md>
+release/mirror-push.md             blake3-256 = <BLAKE3-mirror-push.md>
 
 [artifacts.legal]
 LICENSE                            blake3-256 = <BLAKE3-LICENSE>
