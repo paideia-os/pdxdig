@@ -72,7 +72,7 @@
 # matching the fixture-harness pattern pdxsock adopted at M4-001..M4-003.
 
 name        = pdxdig
-version     = 1.4.0
+version     = 1.5.0
 kind        = tool
 entry       = _start                    # src/main.pdx
 output      = build-out/pdxdig.elf
@@ -81,10 +81,11 @@ caps_decl   = caps.decl
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). --------------
 sources:
-  - src/main.pdx                        # _start + argv parse + semantic-pipe emit + AuditWire call
+  - src/main.pdx                        # _start + argv parse + semantic-pipe emit + AuditWire call + --dot=1 dispatch
   - src/argv_parse.pdx                  # ArgvParse prefix/eq_len/ipv4 helpers (Wave W + GG)
   - src/dns_walker.pdx                  # RCODE parse + CNAME follow (loop-guard 4)
   - src/dig_query.pdx                   # DigQuery: M2-001 net_resolve extern scaffold + WEAK stub (pdxdig#4)
+  - src/dot_wire.pdx                    # DotWire: REAL DNS-over-TLS query path (Wave mu-03, pdxdig#8)
   - src/audit_wire.pdx                  # AuditWire: libpdx-audit STUB wire (pdxdig#7)
   - src/tool_ident.pdx                  # PDX_TOOL_NAME / PDX_TOOL_VERSION externs
 

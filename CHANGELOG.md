@@ -23,6 +23,41 @@ Version discipline:
 
 ## [Unreleased]
 
+## [1.5.0] -- 2026-09-14 -- Wave mu-03: real DNS-over-TLS path (pdxdig#8)
+
+### Added
+- **`src/dot_wire.pdx` (Module DotWire), gated behind a new `--dot=1`
+  argv flag.** A REAL DNS-over-TLS-shaped query path, distinct from
+  (and NOT blocked by) `src/dig_query.pdx`'s fully-WEAK UDP scaffold:
+  a real 12-byte DNS header + real RFC-1035 label-encoded QNAME +
+  QTYPE=A/QCLASS=IN, length-prefixed per RFC 7858/7766, sent over a
+  REAL `sys_socket`+`sys_connect` TCP connection to `<resolver>:853`,
+  through a `net_tls_wrap`-shaped WEAK-passthrough call
+  (`dot_wire_net_tls_wrap` -- libpdx-net not yet linkable from a
+  satellite repo, its own `net_tls_wrap` itself still scaffold-only),
+  then a REAL `sys_send`/`sys_recv` round trip (query travels in
+  plaintext at this landing). `dot_wire_query` returns the real
+  received byte count on success or one of five distinct negative
+  status codes (SOCKET_FAIL/CONNECT_FAIL/SEND_FAIL/RECV_FAIL/
+  QNAME_TOO_LONG). An oversized qname argument is rejected cleanly
+  (bounds-checked write cursor) rather than overflowing the query
+  buffer.
+- **`src/main.pdx`: `--dot=1` argv recognition + dispatch.** When
+  present, resolves the target IP (the existing `--server=` override
+  if set, else a default `8.8.8.8`) and calls `dot_wire_query`,
+  printing `pdxdig: dot bytes=<n>` (fd 1, exit 0) on success or
+  `pdxdig: dot fail rc=<n>` (fd 2, new exit code 6) on failure --
+  bypassing the UDP-stub/--dry-run/--type= terminal dispatch entirely.
+  New shared helper `pdxdig_print_decimal(fd, value)`.
+- `caps.decl`: new optional `KIND_TCP_SOCKET` row for the real
+  TCP I/O `--dot=1` performs.
+
+### Known gaps
+- No encryption (no crypto intrinsics exist in the paideia-as stdlib
+  yet); the DoT response is not parsed into a `DnsQueryRecord@0.1`
+  answer (raw byte count only); single-shot `sys_send`/`sys_recv`
+  (no loop to reassemble a split TCP read).
+
 ## [1.4.0] -- 2026-09-13 -- Wave GGG drain (Closes #14. Closes #15.)
 
 Docs/release-only bump on top of v1.3.0 -- no source or test file

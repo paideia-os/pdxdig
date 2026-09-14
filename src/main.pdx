@@ -1,4 +1,13 @@
-// src/main.pdx -- pdxdig v1.3.0 (Wave GG drain).
+// src/main.pdx -- pdxdig v1.5.0 (Wave mu-03, paideia-os/pdxdig#8).
+//
+// Wave mu-03 adds `--dot=1`: a REAL DNS-over-TLS query path
+// (src/dot_wire.pdx, Module DotWire -- real TCP connect to
+// <resolver>:853, a net_tls_wrap-shaped WEAK-passthrough call, real
+// DNS wire-format send/recv). When `--dot=1` is present, it takes
+// over completely after argv parsing -- see Step 5c in `_start` below
+// -- bypassing the UDP-stub / --dry-run / --type= terminal dispatch
+// entirely. New exit code: 6 = DOT_FAILED (dot_wire_query returned a
+// negative status). See src/dot_wire.pdx for the full design.
 //
 // pdxdig: DNS query CLI (`dig`-equivalent). Ring-3 ELF entry point
 // (`_start`), argv-wired per the frozen execve ABI:
@@ -31,6 +40,10 @@
 //                                              malformed value is a
 //                                              usage refusal (exit 2)
 //   pdxdig --timeout-ms=500 <name>         -- recognized, no-op at v1.3
+//   pdxdig --dot=1 <name>                  -- REAL DoT query (pdxdig#8,
+//                                              Wave mu-03); combines with
+//                                              --server= for the resolver
+//                                              IP (default 8.8.8.8)
 //   pdxdig                                 -- usage on fd 2, exit 2
 //   pdxdig -<unknown>                      -- usage on fd 2, exit 2
 //   pdxdig -*                              -- last positional wins
@@ -44,6 +57,9 @@
 //       malformed --server= value)
 //   3 = no-flag path (v1.1.0 STUB fallback: UDP path not yet wired)
 //   4 = --type=<non-A> UNSUPPORTED_QTYPE path
+//   6 = --dot=1 path taken and dot_wire_query returned a negative
+//       status (socket/connect/send/recv failure, or an oversized
+//       qname argument -- see src/dot_wire.pdx)
 //
 // DnsQueryRecord@0.1 layout (48 bytes, @align(8); §10.2 of the R100
 // user-tools plan) -- unchanged from v1.1.0:
@@ -103,6 +119,19 @@ module Main = structure {
   pub let pdxdig_msg_unsupp_qtype  : [u8; 27] = "pdxdig: unsupported qtype\n\0"
   pub let pdxdig_msg_unsupp_qtype_len : u64 = 26
 
+  // Wave mu-03 (pdxdig#8): --dot=1 result lines. `_prefix` is written
+  // via sys_write, then a runtime-decimal value, then `_suffix`.
+  pub let pdxdig_msg_dot_ok_prefix    : [u8; 19] = "pdxdig: dot bytes=\0"
+  pub let pdxdig_msg_dot_ok_prefix_len : u64 = 18
+
+  pub let pdxdig_msg_dot_fail_prefix  : [u8; 21] = "pdxdig: dot fail rc=\0"
+  pub let pdxdig_msg_dot_fail_prefix_len : u64 = 20
+
+  pub let pdxdig_lit_nl                : [u8; 2] = "\n\0"
+  pub let pdxdig_lit_nl_len            : u64 = 1
+
+  pub let mut pdxdig_num_scratch       : [u8; 24] = uninit @align(8)
+
   // -------------------------------------------------------------------
   // argv-flag name/prefix constants. Each `_len` is the WIRE byte
   // count (excludes trailing NUL) passed to ArgvParse::argv_parse_*.
@@ -123,6 +152,12 @@ module Main = structure {
 
   pub let pdxdig_flag_timeout      : [u8; 14] = "--timeout-ms=\0"
   pub let pdxdig_flag_timeout_len  : u64 = 13
+
+  // Wave mu-03 (pdxdig#8): `--dot=1` enables the real DNS-over-TLS
+  // wire path (src/dot_wire.pdx, Module DotWire). Exact match, like
+  // --dry-run.
+  pub let pdxdig_flag_dot          : [u8; 8]  = "--dot=1\0"
+  pub let pdxdig_flag_dot_len      : u64 = 7
 
   // -------------------------------------------------------------------
   // Semantic-pipe (pdxdig#17) constants + record buffer. Unchanged
@@ -257,7 +292,7 @@ module Main = structure {
         mov rdx, 9;
         call argv_parse_prefix;
         cmp rax, 0;
-        je pdxdig_arg_check_timeout;
+        je pdxdig_arg_check_dot;
 
         // Matched --server=. Parse the dotted-quad at arg_ptr + 9
         // (pdxdig#5, M2-002). Last --server= occurrence wins, same
@@ -278,6 +313,17 @@ module Main = structure {
 
       pdxdig_arg_server_bad:
         or rbx, 4;                               // malformed value -> usage refusal
+        jmp pdxdig_argv_next;
+
+      pdxdig_arg_check_dot:
+        // ---- Try --dot=1 (exact match, 7 bytes; pdxdig#8). -----------
+        mov rdi, [r13 + rbp*8];
+        lea rsi, [rip + pdxdig_flag_dot];
+        mov rdx, 7;
+        call argv_parse_eq_len;
+        cmp rax, 0;
+        je pdxdig_arg_check_timeout;
+        or rbx, 16;                              // dot_requested bit
         jmp pdxdig_argv_next;
 
       pdxdig_arg_check_timeout:
@@ -389,6 +435,74 @@ module Main = structure {
         // Return value intentionally not inspected -- AuditWire STUB
         // always returns AFS_OK (0); see src/audit_wire.pdx header.
 
+        // ---- Step 5c: --dot=1 DNS-over-TLS path (pdxdig#8, Wave mu-03).
+        // Takes over completely when requested: bypasses the UDP-stub
+        // / --dry-run / --type= terminal dispatch below entirely (a
+        // real network attempt supersedes the scaffold-only paths).
+        // server_ip_u32: --server= override if set, else 8.8.8.8 packed
+        // (0x08080808 -- byte-order-invariant since every octet is the
+        // literal value 8, so no MSB-first/LSB-first ambiguity here).
+        mov rax, rbx;
+        and rax, 16;
+        cmp rax, 0;
+        je pdxdig_skip_dot;
+
+        mov rdi, [rip + dig_server_override_set];
+        cmp rdi, 0;
+        jne pdxdig_dot_use_override;
+        mov rdi, 0x08080808;
+        jmp pdxdig_dot_have_ip;
+      pdxdig_dot_use_override:
+        mov rdi, [rip + dig_server_override_ip];
+      pdxdig_dot_have_ip:
+        mov rsi, r14;                            // qname_ptr
+        call dot_wire_query;
+        mov r15, rax;                             // r15 = status (>=0 OK bytes, else -1..-5)
+
+        cmp r15, 0;
+        jl pdxdig_dot_fail;
+
+        mov rdi, 1;
+        lea rsi, [rip + pdxdig_msg_dot_ok_prefix];
+        mov rdx, 18;                               // pdxdig_msg_dot_ok_prefix_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 1;                                 // fd for the decimal emit
+        mov rsi, r15;                                // value = bytes received
+        call pdxdig_print_decimal;
+        mov rdi, 1;
+        lea rsi, [rip + pdxdig_lit_nl];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        xor rdi, rdi;                                 // exit 0
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxdig_dot_fail:
+        xor rax, rax;
+        sub rax, r15;                                  // rax = |status| (1..5)
+        mov r15, rax;
+        mov rdi, 2;
+        lea rsi, [rip + pdxdig_msg_dot_fail_prefix];
+        mov rdx, 20;                                    // pdxdig_msg_dot_fail_prefix_len
+        mov rax, 1;
+        syscall;
+        mov rdi, 2;
+        mov rsi, r15;
+        call pdxdig_print_decimal;
+        mov rdi, 2;
+        lea rsi, [rip + pdxdig_lit_nl];
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        mov rdi, 6;                                      // exit 6 = DOT_FAILED
+        mov rax, 60;
+        syscall;
+        hlt;
+
+      pdxdig_skip_dot:
         // ---- Step 6: terminal dispatch. ------------------------------
         // UNSUPPORTED_QTYPE takes precedence over --dry-run (a rejected
         // --type= is a client-side error regardless of --dry-run).
@@ -446,6 +560,77 @@ module Main = structure {
         mov rax, 60;
         syscall;
         hlt;
+      }
+    }
+
+  // =========================================================================
+  // pdxdig_print_decimal(fd, value) -> ()
+  //
+  // Wave mu-03 (pdxdig#8): decimal-value emit for the --dot=1 result
+  // lines. Straight port of tools/user/mount.pdxfs/src/mount_record.pdx's
+  // `mount_record_print_decimal` div-by-10 loop, staged into this
+  // file's own `pdxdig_num_scratch` and parameterised on `fd` (the
+  // original only ever wrote fd 1; --dot=1's success/failure lines
+  // need fd 1 and fd 2 respectively).
+  // =========================================================================
+  pub let pdxdig_print_decimal : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (fd: u64) (value: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "pdxdig#8 (Wave mu-03) pdxdig_print_decimal. 2-push callee-save (rbx=fd, r12=value) + sub rsp,8: entry rsp%16==8, 2 pushes (16B, even) land back at rsp%16==8, pad -8 -> 0 (no nested CALL in this function, but the pad is kept for uniformity with every other 2-push function in this codebase, e.g. remote's kem_hash_to_hex8). Zero special case (cmp r12,0; jne pdxdig_pd_setup): writes a single '0' byte staged at pdxdig_num_scratch[0] via sys_write(fd,...,1). General case: r9=remaining value, r8=cursor at pdxdig_num_scratch+19 walking DOWN one byte per digit (MSB-last write order, so the final [cursor,+20) slice is already MSB-first, no reversal pass needed); div-by-10 loop identical to mount_record_print_decimal's own (`mov rax,r9; mov rcx,10; xor rdx,rdx; div rcx; add rdx,0x30; mov_b [r8],rdx; mov r9,rax; cmp r9,0; je emit; sub r8,1; jmp loop`); emit: digit count = (pdxdig_num_scratch+20) - r8, sys_write(fd, r8, count). No `test` mnemonic; no `imul`/`mul` (only `div` by the compile-time constant 10). Labels prefixed pdxdig_pd_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // fd
+        mov r12, rsi;                     // value
+
+        cmp r12, 0;
+        jne pdxdig_pd_setup;
+
+        lea r8, [rip + pdxdig_num_scratch];
+        mov rax, 0x30;                      // '0'
+        mov_b [r8 + 0], rax;
+        mov rdi, rbx;
+        mov rsi, r8;
+        mov rdx, 1;
+        mov rax, 1;
+        syscall;
+        jmp pdxdig_pd_done;
+
+      pdxdig_pd_setup:
+        mov r9, r12;
+        lea r8, [rip + pdxdig_num_scratch];
+        add r8, 19;
+      pdxdig_pd_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        mov_b [r8 + 0], rdx;
+        mov r9, rax;
+        cmp r9, 0;
+        je pdxdig_pd_emit;
+        sub r8, 1;
+        jmp pdxdig_pd_loop;
+
+      pdxdig_pd_emit:
+        lea r10, [rip + pdxdig_num_scratch];
+        add r10, 20;
+        mov rdx, r10;
+        sub rdx, r8;
+        mov rdi, rbx;
+        mov rsi, r8;
+        mov rax, 1;
+        syscall;
+
+      pdxdig_pd_done:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
       }
     }
 

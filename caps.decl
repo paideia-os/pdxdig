@@ -39,4 +39,7 @@
 
 !KIND_USER               0x001   # invoker attribution (audit)
  KIND_UDP_SOCKET         0x00B   # optional -- v1.1 stub; M2-001 real
+ KIND_TCP_SOCKET         0x00B   # optional -- Wave mu-03 (pdxdig#8): REAL
+                                 # sys_socket/sys_connect/sys_send/sys_recv
+                                 # to <resolver>:853 on --dot=1 (src/dot_wire.pdx)
  KIND_IPC_ENDPOINT       0x001   # optional -- documentation-only

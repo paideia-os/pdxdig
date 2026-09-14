@@ -1,0 +1,348 @@
+// src/dot_wire.pdx -- pdxdig v1.5.0 (Wave mu-03, paideia-os/pdxdig#8).
+// Module DotWire: DNS-over-TLS (RFC 7858) query path, gated behind the
+// `--dot=1` argv flag.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Unlike src/dig_query.pdx's UDP path (fully WEAK -- no syscall at
+// all, blocked on R100-PREP-002's kernel-side SOCK_DGRAM extension),
+// this file's TCP-based DoT path is REAL network I/O end to end:
+//
+//   1. Encode a real 12-byte DNS header + a real QNAME wire-encoding
+//      of the query positional argument (label-length-prefixed,
+//      root-terminated) + QTYPE=A(1)/QCLASS=IN(1), then prefix the
+//      whole message with its own 2-byte big-endian length (RFC 7858
+//      §3.1 / RFC 7766 -- DNS-over-TCP framing, which DoT also uses
+//      once wrapped in TLS).
+//   2. A REAL `sys_socket` + `sys_connect` to `<resolver>:853` (SOCK_
+//      STREAM, matching `fetch`'s own honest `sys_socket`/`sys_connect`
+//      WEAK-library-stand-in posture for the TCP layer itself).
+//   3. A `net_tls_wrap`-shaped call (`dot_wire_net_tls_wrap`) exactly
+//      at the point a real TLS handshake would sit. Like `pdxcurl`'s
+//      `TlsWire::tls_wire_net_tls_wrap` (src/tls_wire.pdx in that
+//      repo) and `fetch`'s equivalent (this same wave's mu-01
+//      landing), this is a REAL, LINKABLE, locally-defined function
+//      carrying the eventual real 4-argument contract (sock_fd,
+//      trust_cap, hostname_ptr, hostname_len -> u64) whose body is a
+//      WEAK unconditional-success passthrough -- `libpdx-net` is not
+//      yet linkable from a satellite repo (no cross-repo `extern` and
+//      no STB_WEAK linker binding in this toolchain; see pdxcurl's
+//      tls_wire.pdx header for the full argument) and libpdx-net's OWN
+//      `net_tls_wrap` is itself still scaffold-only (ClientHello-send
+//      only, no ServerHello wait, no key derivation -- v0.5.0, no
+//      v0.6.0 tag yet at this wave). The query therefore travels over
+//      PLAINTEXT TCP, not a real TLS record layer, at this landing --
+//      this is a wiring landing (the argv surface + real TCP I/O +
+//      the DNS wire-format + the call-site all exist and are
+//      exercised), not a real DoT handshake. No hostname is available
+//      to pass as SNI (the caller only has a resolver IP, not a
+//      resolver name), so hostname_ptr/hostname_len are 0/0 -- the
+//      stub ignores them regardless.
+//   4. A REAL `sys_send` of the length-prefixed query and a REAL
+//      `sys_recv` of up to 512 bytes of response (the response is
+//      NOT re-framed against its own 2-byte length prefix at this
+//      landing -- `dot_wire_query` reports the raw byte count
+//      `sys_recv` returned; parsing the DoT response into a
+//      DnsQueryRecord@0.1 answer is left to a follow-on landing, same
+//      "ships anyway, named as a known gap" posture as every other
+//      satellite tool in this wave).
+//
+// =============================================================================
+// dot_wire_query(server_ip_u32, qname_ptr) -> status
+// =============================================================================
+//
+//   server_ip_u32 -- packed MSB-first IPv4 (bits[31:24]=a .. [7:0]=d
+//                    for "a.b.c.d"), the SAME byte order sys_connect's
+//                    own `remote_ip` argument expects (src/kernel/
+//                    core/syscall/handlers/sys_connect.pdx) and the
+//                    SAME order `ArgvParse::argv_parse_ipv4` already
+//                    produces for `--server=`'s stored value
+//                    (src/main.pdx's `dig_server_override_ip`) -- no
+//                    repacking needed at the call site.
+//   qname_ptr     -- NUL-terminated query name bytes (the same argv
+//                    pointer `_start` already latches into r14 as
+//                    `qname_ptr` for the existing UDP/dry-run paths).
+//
+//   Return value (status):
+//     >= 0  -- OK; the value IS the byte count `sys_recv` returned
+//              (a genuinely informative success return, not a bare 0).
+//     -1    -- SOCKET_FAIL   (sys_socket refused)
+//     -2    -- CONNECT_FAIL  (sys_connect refused)
+//     -3    -- SEND_FAIL     (sys_send returned <= 0)
+//     -4    -- RECV_FAIL     (sys_recv returned <= 0 -- EOF or error)
+//     -5    -- QNAME_TOO_LONG (a single DNS label exceeded 63 bytes,
+//              RFC 1035 §3.1's hard per-label ceiling)
+//
+// Encoder discipline (paideia-as 0.36+ pitfalls, per user memory)
+// -----------------------------------------------------------------
+//   - No `test rN, rN` (every zero-check is `cmp rN, 0`).
+//   - No 2-op `imul r, imm` (unused -- no multiplication in this file).
+//   - No `and rN, imm64`; the one `and` in this file (`and rax, 0xFF`
+//     for the length-prefix low byte) is a SMALL positive immediate,
+//     safe under the sign-extension pitfall (matches remote#6's
+//     `kem_hash_to_hex8` "and rax,0xF" precedent).
+//   - Byte loads via `xor rN, rN; mov_b rN, [ptr]`; byte stores via
+//     `mov_b [ptr], reg`.
+//   - The five -errno-shaped sentinels are computed via `xor rax,rax;
+//     sub rax, N` (matching pdxcurl's `tlsw_pc_bad` idiom), never a
+//     64-bit immediate `mov`.
+//   - Module basename DotWire (PascalCase, matches `dot_wire.pdx`).
+//   - `dot_wire_query` takes exactly 2 curried args; `dot_wire_net_tls_
+//     wrap` takes exactly 4 (both at or under the 4-arg ceiling).
+//   - Every label prefixed `dot_` (reserved-word discipline).
+//   - `[base + index*1]` addressing is not needed in this file (every
+//     buffer touch during encode advances a plain pointer register,
+//     one byte at a time, via a fixed +0 offset -- matches remote's
+//     kem_fill_seed_bytes precedent of "advance the pointer register
+//     itself" for a variable-length byte-at-a-time loop).
+
+module DotWire = structure {
+
+  pub let DOT_PORT               : u64 = 853
+  pub let DOT_LABEL_MAX          : u64 = 63
+  pub let DOT_RESP_CAP           : u64 = 512
+
+  pub let DOT_ERR_SOCKET_FAIL    : u64 = 1   // reported as -1
+  pub let DOT_ERR_CONNECT_FAIL   : u64 = 2   // reported as -2
+  pub let DOT_ERR_SEND_FAIL      : u64 = 3   // reported as -3
+  pub let DOT_ERR_RECV_FAIL      : u64 = 4   // reported as -4
+  pub let DOT_ERR_QNAME_TOO_LONG : u64 = 5   // reported as -5
+
+  // -- .bss scratch --------------------------------------------------
+  // dot_query_buf layout: [0..1] BE16 length prefix, [2..13] 12-byte
+  // DNS header, [14..] label-encoded QNAME + QTYPE(2) + QCLASS(2).
+  // Capacity 280 = 2 + 12 + (253 worst-case encoded qname) + 4 + slack.
+  pub let mut dot_query_buf : [u8; 280] = uninit @align(8)
+  pub let mut dot_resp_buf  : [u8; 512] = uninit @align(8)
+
+  // =========================================================================
+  // dot_wire_net_tls_wrap(sock_fd, trust_cap, hostname_ptr, hostname_len)
+  //   -> 0 | nz
+  //
+  // WEAK STUB (see file header): always returns 0 (success-passthrough).
+  // Every argument is unread. Pure leaf.
+  // =========================================================================
+  pub let dot_wire_net_tls_wrap : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (sock_fd: u64) (trust_cap: u64) (hostname_ptr: u64) (hostname_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "pdxdig#8 (Wave mu-03) DotWire::dot_wire_net_tls_wrap WEAK stub. Same posture and same reason as pdxcurl's TlsWire::tls_wire_net_tls_wrap (src/tls_wire.pdx in that repo, this wave's mu-02 item): libpdx-net is not linkable from a satellite repo (no cross-repo extern, no STB_WEAK binding in this toolchain) and libpdx-net's OWN net_tls_wrap is itself still scaffold-only (ClientHello-send only, no key derivation) -- so a real cross-repo call would both fail `ld --fatal-warnings` and not yet do anything useful if it linked. This function carries the eventual real 4-arg contract (rdi=sock_fd, rsi=trust_cap, rdx=hostname_ptr, rcx=hostname_len) and unconditionally returns 0 (success) without inspecting any argument -- the DoT query proceeds in plaintext over the already-open TCP socket. The ONE call site (dot_wire_query, this file) is the only edit a future real libpdx-net landing needs. Pure leaf, no nested calls, no push/pop needed.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // dot_wire_query(server_ip_u32, qname_ptr) -> status (see file header)
+  // =========================================================================
+  pub let dot_wire_query : (u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (server_ip_u32: u64) (qname_ptr: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, cap},
+      justification: "pdxdig#8 (Wave mu-03) DotWire::dot_wire_query. 5-push callee-save (rbx=server_ip_u32, r12=qname src cursor, r13=encode-phase write-cursor CEILING then repurposed as fd post-connect (the two uses never overlap -- the ceiling is dead once Phase 3 begins), r14=query-buf write cursor then total-send-len then bytes-received, r15=per-label length-backpatch pointer) -- entry rsp%16==8 (post-CALL), 5 pushes (40B, odd count) land exactly at rsp%16==0, so NO `sub rsp,8` pad is needed or present (matches remote's kem_peer_key_fingerprint_hex 1-push precedent's same odd-push-count-from-8 arithmetic, extended here to 5). Phase 1 (label encoding, ZERO syscalls in this phase so every non-callee-save register is freely reused as scratch): r13 is set once to &dot_query_buf+270 (a fixed ceiling, 10 bytes of headroom below the 280-byte capacity for the terminating root label + QTYPE/QCLASS) and checked via `cmp r14,r13; jae dot_query_qname_too_long` both before reserving each label's length byte AND before every single per-byte copy -- an oversized argv qname refuses cleanly instead of overflowing dot_query_buf into dot_resp_buf's adjacent .bss slot. r14 starts at &dot_query_buf+14 (past the 2-byte length prefix + 12-byte header reservation, both backfilled in Phase 2); the outer loop (dot_label_top) reserves one length byte (r15=r14, r14+=1) then the inner loop (dot_label_copy) reads qname bytes one at a time via xor+mov_b, copying non-'.'/non-NUL bytes to the write cursor and counting them in r9 (capped at DOT_LABEL_MAX=63, else -> dot_query_qname_too_long), until a '.' (backpatch r15 with r9, skip the dot, loop) or a NUL (backpatch r15 with r9, write a terminating zero-length root label, fall through) is seen. Phase 2: QTYPE=1/QCLASS=1 written as four explicit bytes (0,1,0,1); msg_len computed as r14 minus (&dot_query_buf+2) into a scratch register (pre-first-syscall, so any volatile register is safe here); the header's 12 bytes (ID=0x1234, FLAGS=0x0100 recursion-desired, QDCOUNT=1, ANCOUNT/NSCOUNT/ARCOUNT=0) and the 2-byte BE length prefix (msg_len via one `shr rax,8` for the high byte + one `and rax,0xFF` -- a SMALL, sign-extension-safe immediate -- for the low byte) are then backfilled at &dot_query_buf+2 and +0 respectively; r14 is repurposed to hold msg_len+2 (the TOTAL send length including its own prefix). Phase 3: sys_socket (SC+87, AF_INET/SOCK_STREAM) -> jl dot_query_socket_fail; fd stashed in r13 (the encode-phase ceiling is dead by this point, safe to reuse) BEFORE sys_connect (SC+91, dst=rbx, port=DOT_PORT=853) clobbers rdi/rsi/rdx/rax -> jl dot_query_connect_fail. Phase 4: call dot_wire_net_tls_wrap(r13, 0, 0, 0) -- return ignored (always 0). Phase 5: sys_send (SC+92, fd=r13, buf=&dot_query_buf, len=r14) -> jle dot_query_send_fail. Phase 6: sys_recv (SC+93, fd=r13, buf=&dot_resp_buf, len=DOT_RESP_CAP=512) -> jle dot_query_recv_fail; success stashes the byte count in r14, issues sys_shutdown (SC+94, SHUT_RDWR) best-effort (return ignored), and returns r14 verbatim in rax. Every failure branch computes its -errno-shaped sentinel via `xor rax,rax; sub rax,N` (N in 1..5) and falls into the shared dot_query_epilogue (5 pops, ret) -- no per-branch cleanup on socket/connect/send/recv failure (an unclosed fd on an early-error path is harmless since the caller process exits shortly after; matches fetch.pdx's own error-branch posture of skipping shutdown on failure). Register discipline: rbx/r12/r13/r14/r15 are the only values ever live across a SYSCALL or the one nested `call`; every other register (rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11) is reloaded fresh for each syscall's arguments and never read after one without being explicitly reloaded first. Encoder discipline (per user memory 'pdx encoder pitfalls'): no `test rN,rN` (every check is `cmp rN,0`); no 2-op `imul`; the only `and` (`and rax,0xFF`) is a small positive immediate; byte loads via xor+mov_b, byte stores via mov_b [ptr],reg; every label prefixed `dot_`; module basename DotWire; exactly 2 curried args.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // server_ip_u32
+        mov r12, rsi;                    // qname_ptr (src cursor)
+
+        // ---- Phase 1: label-encode QNAME into dot_query_buf+14. ----
+        // r13 (free until Phase 3 claims it for fd) holds a fixed
+        // write-cursor CEILING for the whole encode phase: &dot_query_
+        // buf + 270, leaving 10 bytes of headroom below the 280-byte
+        // capacity for the terminating root label + QTYPE/QCLASS. Both
+        // the per-label reservation AND every per-byte copy check r14
+        // against it -- an oversized argv qname refuses cleanly
+        // (DOT_ERR_QNAME_TOO_LONG) instead of overflowing dot_query_buf
+        // into dot_resp_buf's .bss slot.
+        lea r13, [rip + dot_query_buf];
+        add r13, 270;                       // write-cursor ceiling
+        lea r14, [rip + dot_query_buf];
+        add r14, 14;                       // write cursor, past prefix+header
+
+      dot_label_top:
+        cmp r14, r13;
+        jae dot_query_qname_too_long;
+        mov r15, r14;                       // len_pos = cursor
+        add r14, 1;                          // reserve the length byte
+        xor r9, r9;                           // label_len = 0
+
+      dot_label_copy:
+        cmp r14, r13;
+        jae dot_query_qname_too_long;
+        xor r10, r10;
+        mov_b r10, [r12 + 0];
+        cmp r10, 0;
+        je dot_label_end_nul;
+        cmp r10, 0x2e;                          // '.'
+        je dot_label_end_dot;
+        mov_b [r14 + 0], r10;
+        add r14, 1;
+        add r12, 1;
+        add r9, 1;
+        cmp r9, 63;                               // DOT_LABEL_MAX
+        ja dot_query_qname_too_long;
+        jmp dot_label_copy;
+
+      dot_label_end_dot:
+        mov_b [r15 + 0], r9;
+        add r12, 1;                                // skip '.'
+        jmp dot_label_top;
+
+      dot_label_end_nul:
+        mov_b [r15 + 0], r9;
+        xor r10, r10;
+        mov_b [r14 + 0], r10;                        // terminating root label
+        add r14, 1;
+
+        // ---- Phase 2: QTYPE=1 (A), QCLASS=1 (IN); header; length prefix.
+        mov r10, 0;
+        mov_b [r14 + 0], r10;
+        add r14, 1;
+        mov r10, 1;
+        mov_b [r14 + 0], r10;
+        add r14, 1;
+        mov r10, 0;
+        mov_b [r14 + 0], r10;
+        add r14, 1;
+        mov r10, 1;
+        mov_b [r14 + 0], r10;
+        add r14, 1;
+
+        lea r11, [rip + dot_query_buf];
+        add r11, 2;                                  // r11 = &body[0]
+        mov r9, r14;
+        sub r9, r11;                                   // r9 = msg_len
+
+        lea r11, [rip + dot_query_buf];
+        // DNS header (12 bytes at +2): ID=0x1234, FLAGS=0x0100,
+        // QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0.
+        mov r10, 0x12;
+        mov_b [r11 + 2], r10;
+        mov r10, 0x34;
+        mov_b [r11 + 3], r10;
+        mov r10, 0x01;
+        mov_b [r11 + 4], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 5], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 6], r10;
+        mov r10, 0x01;
+        mov_b [r11 + 7], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 8], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 9], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 10], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 11], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 12], r10;
+        mov r10, 0x00;
+        mov_b [r11 + 13], r10;
+
+        // 2-byte BE length prefix at [0..1].
+        mov rax, r9;
+        shr rax, 8;
+        mov_b [r11 + 0], rax;
+        mov rax, r9;
+        and rax, 0xFF;
+        mov_b [r11 + 1], rax;
+
+        mov r14, r9;
+        add r14, 2;                                    // r14 = total send length
+
+        // ---- Phase 3: sys_socket + sys_connect. --------------------
+        mov rdi, 2;                                      // AF_INET
+        mov rsi, 1;                                       // SOCK_STREAM
+        xor rdx, rdx;
+        mov rax, 87;                                       // SC+ sys_socket
+        syscall;
+        cmp rax, 0;
+        jl dot_query_socket_fail;
+        mov r13, rax;                                       // fd
+
+        mov rdi, r13;
+        mov rsi, rbx;                                         // server_ip_u32
+        mov rdx, 853;                                          // DOT_PORT
+        mov rax, 91;                                            // SC+ sys_connect
+        syscall;
+        cmp rax, 0;
+        jl dot_query_connect_fail;
+
+        // ---- Phase 4: TLS-wrap call site (WEAK passthrough). --------
+        mov rdi, r13;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call dot_wire_net_tls_wrap;
+
+        // ---- Phase 5: sys_send the length-prefixed query. -----------
+        mov rdi, r13;
+        lea rsi, [rip + dot_query_buf];
+        mov rdx, r14;
+        mov rax, 92;                                            // SC+ sys_send
+        syscall;
+        cmp rax, 0;
+        jle dot_query_send_fail;
+
+        // ---- Phase 6: sys_recv the response (best-effort, capped). --
+        mov rdi, r13;
+        lea rsi, [rip + dot_resp_buf];
+        mov rdx, 512;                                            // DOT_RESP_CAP
+        mov rax, 93;                                              // SC+ sys_recv
+        syscall;
+        cmp rax, 0;
+        jle dot_query_recv_fail;
+        mov r14, rax;                                              // bytes received
+
+        mov rdi, r13;
+        mov rsi, 2;                                                 // SHUT_RDWR
+        mov rax, 94;                                                 // SC+ sys_shutdown
+        syscall;
+
+        mov rax, r14;
+        jmp dot_query_epilogue;
+
+      dot_query_socket_fail:
+        xor rax, rax;
+        sub rax, 1;                                                   // DOT_ERR_SOCKET_FAIL
+        jmp dot_query_epilogue;
+
+      dot_query_connect_fail:
+        xor rax, rax;
+        sub rax, 2;                                                   // DOT_ERR_CONNECT_FAIL
+        jmp dot_query_epilogue;
+
+      dot_query_send_fail:
+        xor rax, rax;
+        sub rax, 3;                                                   // DOT_ERR_SEND_FAIL
+        jmp dot_query_epilogue;
+
+      dot_query_recv_fail:
+        xor rax, rax;
+        sub rax, 4;                                                   // DOT_ERR_RECV_FAIL
+        jmp dot_query_epilogue;
+
+      dot_query_qname_too_long:
+        xor rax, rax;
+        sub rax, 5;                                                   // DOT_ERR_QNAME_TOO_LONG
+        // fall through to dot_query_epilogue
+
+      dot_query_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
